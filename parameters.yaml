@@ -1,0 +1,30 @@
+rolling_window: 2000   # 指定rolling_window窗口大小
+freq: 30min    # 指定数据频率
+
+sym: btcusdt    # 指定gplearn做训练的品种数据, 不支持截面上的多品种   btcusdt ethusdt bnbusdt solusdt
+y_train_ret_period: 1    # 指定在训练集上的y值是未来第几个bar的收益率差
+start_date_train: '20211201'
+end_date_train: '20240101'
+start_date_test: '20240101'
+end_date_test: '20240910'
+
+
+execution_mode: 'once'   # 'once' or 'loop' , 设定执行模式，once是一次性执行，loop是无限次执行
+
+gp_settings:
+  population_size: 20000
+  hall_of_fame: 10000
+  n_components: 5000
+  generations: 3
+  tournament_size: 888
+  const_range: null
+  init_depth: [2, 5]
+  metric: 'avg_pic'  #'avg_pic', 'avg_sic', 'sharp', 'calmar', 'sharpe_fixed_threshold', 'sharpe_std_threshold'
+  parsimony_coefficient: 0.0005    #0.0005
+  p_crossover: 0.8
+  p_subtree_mutation: 0.02
+  p_hoist_mutation: 0.02
+  p_point_mutation: 0.02
+  p_point_replace: 0.5
+  corrcoef_threshold: 0.8
+  n_jobs: -1
