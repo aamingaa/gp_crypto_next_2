@@ -130,7 +130,7 @@ class GPAnalyzer:
                     self.start_date_test, self.end_date_test, 
                     coarse_grain_period=getattr(self, 'coarse_grain_period', '2h'),
                     feature_lookback_bars=getattr(self, 'feature_lookback_bars', 8),
-                    rolling_step=getattr(self, 'rolling_step', '10min'),
+                    rolling_time_step=getattr(self, 'rolling_step', '10min'),
                     y_train_ret_period=self.y_train_ret_period,
                     rolling_w=self.rolling_window, 
                     output_format='ndarry',

@@ -125,8 +125,8 @@ def data_prepare_coarse_grain_rolling_offset(
         end_date_test: str,
         coarse_grain_period: str = '2h',  # 粗粒度特征桶周期
         feature_lookback_bars: int = 8,    # 特征回溯桶数（8个2h = 16小时）
-        rolling_step: str = '15min',       # 滚动步长
-        y_train_ret_period: int = 8,       # 预测周期（以coarse_grain为单位，1表示1个2h）
+        rolling_time_step: str = '15min',       # 滚动步长
+        y_train_ret_period: int = 8,
         rolling_w: int = 2000,
         output_format: str = 'ndarry',
         data_dir: str = '',
@@ -171,8 +171,8 @@ def data_prepare_coarse_grain_rolling_offset(
     print(f"\n{'='*60}")
     print(f"粗粒度特征 + 细粒度滚动数据准备（offset参数版本）")
     print(f"品种: {sym}")
-    print(f"粗粒度周期: {coarse_grain_period}, 特征窗口 {feature_lookback_bars} × {coarse_grain_period} = {feature_lookback_bars * pd.Timedelta(coarse_grain_period).total_seconds() / 3600:.1f}小时")
-    print(f"预测周期: {y_train_ret_period} × {rolling_step} = {y_train_ret_period * pd.Timedelta(rolling_step).total_seconds() / 3600:.1f}小时")
+    print(f"回溯的周期: {coarse_grain_period}, 特征窗口 {feature_lookback_bars} × {coarse_grain_period} = {feature_lookback_bars * pd.Timedelta(coarse_grain_period).total_seconds() / 3600:.1f}小时")
+    print(f"预测的周期: {y_train_ret_period} × {rolling_time_step} = {y_train_ret_period * pd.Timedelta(rolling_time_step).total_seconds() / 3600:.1f}小时")
     print(f"{'='*60}\n")
     
     # ========== 第一步：读取原始数据（细粒度） ==========
@@ -191,22 +191,25 @@ def data_prepare_coarse_grain_rolling_offset(
     
     # 计算需要多少组不同偏移的resample
     coarse_period_minutes = pd.Timedelta(coarse_grain_period).total_seconds() / 60
-    rolling_step_minutes = pd.Timedelta(rolling_step).total_seconds() / 60
+    rolling_time_step_td = pd.Timedelta(rolling_time_step)
+    rolling_step_minutes = rolling_time_step_td.total_seconds() / 60
     num_offsets = int(coarse_period_minutes / rolling_step_minutes)
 
 
     if use_fine_grain_precompute:
-        print(f"滚动步长: {rolling_step} ({rolling_step_minutes}分钟)")
+        print(f"滚动步长: {rolling_step_minutes}分钟")
         print(f"需要预计算 {num_offsets} 组不同偏移的粗粒度桶")
         
         samples = []
-        prediction_horizon_td = pd.Timedelta(rolling_step) * y_train_ret_period
+        prediction_horizon_td = rolling_step_minutes * y_train_ret_period
         
         for i in range(num_offsets):
             offset = pd.Timedelta(minutes=i * rolling_step_minutes)
             print(f"\n组{i}: 偏移 {offset} ...")
             
-            # 🔑 关键改进：使用offset参数替代时间索引偏移
+            if i >= 1 :
+                print("hello")
+
             z_raw_copy = z_raw.copy()
             original_start = z_raw_copy.index.min()
             original_end = z_raw_copy.index.max()
@@ -240,21 +243,19 @@ def data_prepare_coarse_grain_rolling_offset(
             #   其 index 同样是桶的 left label（也就是桶的 open_time / 起始时刻 t0）。
             # - features_df.index (= row_timestamps) 表示粗桶起始时刻 t0（例如 10:00）。
             #   该行特征使用的是区间 [t0, t0 + coarse_grain_period) 的聚合结果；并且 BaseFeature 内的 rolling_zscore_window 是“粗桶行数”，
-            #   pandas rolling(std) 默认包含当前行（窗口是右对齐、含当前点）。
             # - decision_timestamps = t0 + coarse_grain_period（例如 12:00），代表桶结束/决策时刻。
             # - prediction_timestamps = decision_timestamps + rolling_step * y_train_ret_period（例如 rolling_step=15m 且 y_train_ret_period=8 时为 14:00）。
             # - 当前价(用于 label 分母)取决策点刚结束的那根 15m K 线的 close：current_data_timestamps = decision_timestamps - 15m
             #   （例如 11:45，对应区间 [11:45, 12:00) 的 close）。
-            row_timestamps = features_df.index
            
             # 1. 计算决策时间 (物理时间 12:00)
-            decision_timestamps = row_timestamps + pd.to_timedelta(coarse_grain_period)
+            # decision_timestamps = features_df.index + pd.to_timedelta(coarse_grain_period)
 
             # 2. 【核心修正】计算在 z_raw (Open Time Index) 中对应的“当前行”
             # 如果决策时间是 12:00，我们需要取 11:45 开始的那根 K 线 (因为它在 12:00 结束)
-            lookup_offset = pd.Timedelta(rolling_step) # 例如 15min
+            # lookup_offset = pd.Timedelta(rolling_step) # 例如 15min
             # current_data_timestamps = decision_timestamps - lookup_offset
-            current_data_timestamps = decision_timestamps
+            current_data_timestamps = features_df.index + pd.to_timedelta(coarse_grain_period)
             
             # 向量化计算未来时刻
             prediction_timestamps = current_data_timestamps + prediction_horizon_td
@@ -277,7 +278,7 @@ def data_prepare_coarse_grain_rolling_offset(
                     
             # 将标签添加到features_df
             features_df['feature_offset'] = offset.total_seconds() / 60  # 转换为分钟
-            features_df['decision_timestamps'] = decision_timestamps
+            # features_df['decision_timestamps'] = current_data_timestamps
             features_df['current_data_timestamps'] = current_data_timestamps
             features_df['prediction_timestamps'] = prediction_timestamps
             features_df['t_price'] = t_prices.values
