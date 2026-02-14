@@ -93,6 +93,20 @@ class GPAnalyzer:
         self.rolling_window = self.config.get('rolling_window', 2000)
         self.annual_bars = calculate_annual_bars(self.freq)
         
+        self.data_dir = self.config.get('data_dir', '')
+        
+        self.coarse_grain_period = self.config.get('coarse_grain_period', '2h')
+        self.feature_lookback_bars = self.config.get('feature_lookback_bars', 8)
+        self.rolling_step = self.config.get('rolling_step', '15min')
+
+        # 文件路径配置（用于直接指定数据文件）
+        self.file_path = self.config.get('file_path', None)  # tick交易数据文件路径
+        self.kline_file_path = self.config.get('kline_file_path', None)  # K线数据文件路径（备用）
+        # 数据源开关
+        self.data_source = self.config.get('data_source', 'coarse_grain')
+        self.read_frequency = self.config.get('read_frequency', 'monthly')
+        self.timeframe = self.config.get('timeframe', '15m')
+
 
         # 自动加载其他配置项
         for key, value in self.config.items():
@@ -105,14 +119,49 @@ class GPAnalyzer:
         只在第一次调用时执行数据加载。
         """
         if not self.data_initialized:
-            self.X_all, self.X_train, self.y_train, self.ret_train, self.X_test, self.y_test, self.ret_test, self.feature_names,self.open_train,self.open_test,self.close_train,self.close_test, self.z_index ,self.ohlc= dataload.data_prepare(
-                self.sym, self.freq, self.start_date_train, self.end_date_train,
-                self.start_date_test, self.end_date_test, rolling_w=self.rolling_window)
-            self.data_initialized = True
-            self.test_index = self.z_index[(self.z_index >= pd.to_datetime(self.start_date_test)) & (
-                        self.z_index <= pd.to_datetime(self.end_date_test))]
-            self.train_index = self.z_index[(self.z_index >= pd.to_datetime(self.start_date_train)) & (
-                        self.z_index < pd.to_datetime(self.end_date_train))]           
+            if str(self.data_source).lower() == 'coarse_grain':
+                (self.X_all, self.X_train, self.y_train, self.ret_train,
+                 self.X_test, self.y_test, self.ret_test, self.feature_names,
+                 self.open_train, self.open_test, self.close_train, self.close_test,
+                 self.z_index, self.ohlc, self.y_p_train_origin, self.y_p_test_origin,
+                 self.train_index, self.test_index
+                 ) = dataload.data_prepare_coarse_grain_rolling_offset(
+                    self.sym, self.freq, self.start_date_train, self.end_date_train,
+                    self.start_date_test, self.end_date_test, 
+                    coarse_grain_period=getattr(self, 'coarse_grain_period', '2h'),
+                    feature_lookback_bars=getattr(self, 'feature_lookback_bars', 8),
+                    rolling_step=getattr(self, 'rolling_step', '10min'),
+                    y_train_ret_period=self.y_train_ret_period,
+                    rolling_w=self.rolling_window, 
+                    output_format='ndarry',
+                    data_dir=self.data_dir, 
+                    read_frequency=self.read_frequency, 
+                    timeframe=self.timeframe,
+                    file_path=self.file_path,
+                    include_categories = getattr(self, 'include_categories', ['momentum']),
+                    predict_label = getattr(self, 'predict_label', 'norm')
+                    )
+                
+                self.data_initialized = True
+                # self.test_index = self.z_index[(self.z_index >= pd.to_datetime(self.start_date_test)) & (
+                #             self.z_index <= pd.to_datetime(self.end_date_test))]
+                # self.train_index = self.z_index[(self.z_index >= pd.to_datetime(self.start_date_train)) & (
+                #             self.z_index < pd.to_datetime(self.end_date_train))]   
+                self.train_index = self.close_train.index if hasattr(self.close_train, 'index') else self.z_index[:len(self.close_train)]
+                self.test_index = self.close_test.index if hasattr(self.close_test, 'index') else self.z_index[-len(self.close_test):]   
+            
+              
+            # elif str(self.data_source).lower() == 'kline':
+            #     self.X_all, self.X_train, self.y_train, self.ret_train, self.X_test, self.y_test, self.ret_test, 
+            #     self.feature_names,self.open_train,self.open_test,self.close_train,self.close_test, self.z_index ,self.ohlc = dataload.data_prepare(
+            #         self.sym, self.freq, self.start_date_train, self.end_date_train,
+            #         self.start_date_test, self.end_date_test, rolling_w=self.rolling_window)
+            #     self.data_initialized = True
+            #     self.test_index = self.z_index[(self.z_index >= pd.to_datetime(self.start_date_test)) & (
+            #                 self.z_index <= pd.to_datetime(self.end_date_test))]
+            #     self.train_index = self.z_index[(self.z_index >= pd.to_datetime(self.start_date_train)) & (
+            #                 self.z_index < pd.to_datetime(self.end_date_train))]  
+        
         else:
             print("Shared data already initialized. Skipping data loading.")
 
