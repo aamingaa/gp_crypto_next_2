@@ -215,8 +215,8 @@ def data_prepare_coarse_grain_rolling_offset(
             original_end = z_raw_copy.index.max()
 
             coarse_bars = resample_with_offset(
-                z_raw_copy, 
-                coarse_grain_period, 
+                z = z_raw_copy, 
+                resample_freq = coarse_grain_period, 
                 offset=offset,  # 直接使用offset参数
                 closed='left', 
                 label='left'
@@ -1071,7 +1071,7 @@ def _read_feather_file(feather_path: str) -> Optional[pd.DataFrame]:
         print(f"✗ 读取 feather 文件失败: {os.path.basename(feather_path)}, 错误: {str(e)}")
         return None
 
-def resample_with_offset(z: pd.DataFrame, freq: str, offset: pd.Timedelta = None, 
+def resample_with_offset(z: pd.DataFrame, resample_freq: str, offset: pd.Timedelta = None, 
                         closed: str = 'left', label: str = 'left') -> pd.DataFrame:
     '''
     支持offset参数的resample函数 - 使用pandas原生offset参数，避免时间索引偏移的问题
@@ -1087,16 +1087,16 @@ def resample_with_offset(z: pd.DataFrame, freq: str, offset: pd.Timedelta = None
     返回:
         重采样后的DataFrame
     '''
-    if freq == '15m':
+    if resample_freq == '15m':
         return z
     
-    if freq != '1min' and freq != '1m':
+    if resample_freq != '1min' and resample_freq != '1m':
         z.index = pd.to_datetime(z.index)
         
         # 使用pandas原生的offset参数，而不是偏移索引
         if offset is not None:
             z_resampled = z.resample(
-                freq, 
+                resample_freq, 
                 closed=closed, 
                 label=label,
                 offset=offset  # 🔑 关键：使用pandas原生offset参数

@@ -17,7 +17,8 @@ from tqdm import tqdm
 warnings.filterwarnings('ignore')
 
 
-def define_base_fields():
+# def define_base_fields():
+def define_base_fields(rolling_zscore_window: int = 2000, include_categories: List[str] = None, init_ohlcva_df: pd.DataFrame = None):
     """
     本函数定义了基础的特征计算公式. 将来会持续维护这个函数，增加更多的特征计算公式
     这是唯一的定义特征的地方，其他地方不应该再定义特征
@@ -102,10 +103,22 @@ def define_base_fields():
             ss[i] = c1 * (HL[i] + HL[i-1]) / 2 + b1 * ss[i-1] + c3 * ss[i-2]
         return ss
 
+    # def norm(x: np.ndarray) -> np.ndarray:
+    #     x = np.asarray(x, dtype=np.float64)
+    #     # mean = pd.Series(x).rolling(2000, min_periods=1).mean().values
+    #     std = pd.Series(x).rolling(2000, min_periods=1).std().values
+    #     # x_value = (x - mean) / np.clip(np.nan_to_num(std),
+    #     #                                a_min=1e-6, a_max=None)
+    #     x_value = (x ) / np.clip(np.nan_to_num(std),
+    #                                    a_min=1e-6, a_max=None)
+    #     # x_value = np.clip(x_value, -6, 6)
+    #     x_value = np.nan_to_num(x_value, nan=0.0, posinf=0.0, neginf=0.0)
+    #     return x_value
+
     def norm(x: np.ndarray) -> np.ndarray:
         x = np.asarray(x, dtype=np.float64)
         # mean = pd.Series(x).rolling(2000, min_periods=1).mean().values
-        std = pd.Series(x).rolling(2000, min_periods=1).std().values
+        std = pd.Series(x).rolling(rolling_zscore_window, min_periods=1).std().values
         # x_value = (x - mean) / np.clip(np.nan_to_num(std),
         #                                a_min=1e-6, a_max=None)
         x_value = (x ) / np.clip(np.nan_to_num(std),
@@ -113,6 +126,7 @@ def define_base_fields():
         # x_value = np.clip(x_value, -6, 6)
         x_value = np.nan_to_num(x_value, nan=0.0, posinf=0.0, neginf=0.0)
         return x_value
+    
 
     return {
         'lgp_shortcut_illiq_6': lambda data: norm(np.nan_to_num(pd.Series(2*(data['h'] - data['l']) - np.abs(data['c'] - data['o'])).rolling(6, min_periods=1).apply(lambda x: x.mean()))),
@@ -285,16 +299,29 @@ def calculate_features_df_tail(input_df, rolling_zscore_window):
 
 
 class BaseFeature:
-    def __init__(self, init_ohlcva_df):
+    
+    def __init__(self, init_ohlcva_df, include_categories: List[str] = None, rolling_zscore_window: int = 2000):
         # 将所有列转换为 double 类型
-        init_ohlcva_df = init_ohlcva_df.astype(np.float64)
+        self.init_ohlcva_df = init_ohlcva_df.astype(np.float64)
 
-        self.rolling_zscore_window: int = 2000
+        self.rolling_zscore_window = rolling_zscore_window
         print('feature 定义')
-        self.base_fields = define_base_fields()
+        # self.base_fields = define_base_fields()
+        self.base_fields = define_base_fields(rolling_zscore_window = rolling_zscore_window, include_categories=include_categories)
         print('init_feature 计算')
         self.init_feature_df = self._call(init_ohlcva_df)
         print('init_feature 完成')
+
+    # def __init__(self, init_ohlcva_df):
+    #     # 将所有列转换为 double 类型
+    #     init_ohlcva_df = init_ohlcva_df.astype(np.float64)
+
+    #     self.rolling_zscore_window: int = 2000
+    #     print('feature 定义')
+    #     self.base_fields = define_base_fields()
+    #     print('init_feature 计算')
+    #     self.init_feature_df = self._call(init_ohlcva_df)
+    #     print('init_feature 完成')
 
 
 
