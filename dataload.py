@@ -408,6 +408,257 @@ def data_prepare_coarse_grain_rolling_offset(
             df_samples.index, ohlc_aligned, y_p_train_origin, y_p_test_origin,
             train_index, test_index)
 
+
+def data_prepare_coarse_grain_rolling_offset_v2(
+        sym: str,
+        freq: str,
+        start_date_train: str,
+        end_date_train: str,
+        start_date_test: str,
+        end_date_test: str,
+        coarse_grain_period: str = '2h',
+        feature_lookback_bars: int = 8,
+        rolling_time_step: str = '15min',
+        y_train_ret_period: int = 8,
+        rolling_w: int = 2000,
+        output_format: str = 'ndarry',
+        data_dir: str = '',
+        read_frequency: str = '',
+        timeframe: str = '',
+        file_path: Optional[str] = None,
+        use_parallel: bool = True,
+        n_jobs: int = -1,
+        use_fine_grain_precompute: bool = True,
+        include_categories: List[str] = None,
+        remove_warmup_rows: bool = True,
+        predict_label: str = 'norm'
+    ):
+    """
+    粗粒度特征 + 细粒度滚动（修正版）
+
+    修复点：
+    1) 时间锚点统一为“决策时刻”，避免按桶起点切分带来的边界歧义。
+    2) current/future 价格都用 15min open_time index 对齐到“已收盘的K线”。
+    3) 预测周期严格使用 Timedelta 计算，避免分钟数值直接加到时间戳。
+    4) 仅在必要列做缺失处理，避免对 OHLC 全量 ffill 造成伪K线。
+    """
+    del freq, feature_lookback_bars, use_parallel, n_jobs, use_fine_grain_precompute, predict_label
+
+    print(f"\n{'='*60}")
+    print("粗粒度特征 + 细粒度滚动数据准备（v2修正版）")
+    print(f"品种: {sym}")
+    print(f"特征周期: {coarse_grain_period}, 滚动步长: {rolling_time_step}")
+    print(f"预测周期: {y_train_ret_period} × {rolling_time_step}")
+    print(f"{'='*60}\n")
+
+    # ========== 第一步：读取细粒度原始数据 ==========
+    z_raw = data_load_v2(
+        sym,
+        data_dir=data_dir,
+        start_date=start_date_train,
+        end_date=end_date_test,
+        timeframe=timeframe,
+        read_frequency=read_frequency,
+        file_path=file_path
+    )
+    z_raw = z_raw.copy()
+    z_raw.index = pd.to_datetime(z_raw.index)
+    z_raw.sort_index(inplace=True)
+    z_raw = z_raw[(z_raw.index >= pd.to_datetime(start_date_train)) &
+                  (z_raw.index <= pd.to_datetime(end_date_test))]
+    print(f"读取原始数据: {len(z_raw)} 行，时间范围 {z_raw.index.min()} 至 {z_raw.index.max()}")
+
+    # ========== 第二步：参数检查与时间常量 ==========
+    coarse_td = pd.Timedelta(coarse_grain_period)
+    rolling_step_td = pd.Timedelta(rolling_time_step)
+    prediction_horizon_td = rolling_step_td * y_train_ret_period
+
+    if coarse_td <= pd.Timedelta(0) or rolling_step_td <= pd.Timedelta(0):
+        raise ValueError("coarse_grain_period 与 rolling_time_step 必须大于0")
+    if coarse_td % rolling_step_td != pd.Timedelta(0):
+        raise ValueError("coarse_grain_period 必须能被 rolling_time_step 整除")
+
+    num_offsets = int(coarse_td / rolling_step_td)
+    print(f"需要预计算 {num_offsets} 组 offset（{coarse_grain_period} / {rolling_time_step}）")
+
+    # 与原方法保持一致：固定使用这7列做聚合，便于后续特征扩展
+    agg_map = {
+        'o': 'first',
+        'h': 'max',
+        'l': 'min',
+        'c': 'last',
+        'vol': 'sum',
+        'vol_ccy': 'sum',
+        'trades': 'sum',
+    }
+
+    # ========== 第三步：按 offset 预计算 2h 特征 ==========
+    samples = []
+    for i in range(num_offsets):
+        offset = i * rolling_step_td
+        print(f"\n组{i}: offset={offset}")
+
+        coarse_bars = z_raw.resample(
+            coarse_grain_period,
+            closed='left',
+            label='left',
+            offset=offset
+        ).agg(agg_map)
+
+        # 对OHLC缺失的桶直接丢弃，成交量类缺失填0
+        coarse_bars = coarse_bars.dropna(subset=['o', 'h', 'l', 'c'])
+        for col in ('vol', 'vol_ccy', 'trades'):
+            coarse_bars[col] = coarse_bars[col].fillna(0.0)
+
+        # 防止resample产生范围外空桶
+        coarse_bars = coarse_bars[(coarse_bars.index >= z_raw.index.min()) &
+                                  (coarse_bars.index <= z_raw.index.max())]
+        if coarse_bars.empty:
+            continue
+
+        base_feature = originalFeature.BaseFeature(
+            coarse_bars.copy(),
+            include_categories=include_categories,
+            rolling_zscore_window=max(1, int(np.ceil(rolling_w / max(1, num_offsets))))
+        )
+        features_df = base_feature.init_feature_df.copy()
+        if features_df.empty:
+            continue
+
+        # 时间轴定义（严格按 15min open_time 索引对齐）：
+        # 1) features_df.index = 粗粒度桶起点 t0，对应特征来自区间 [t0, t0 + coarse_td)
+        # 2) decision_timestamps = t0 + coarse_td，表示该粗桶刚结束、可做预测的决策时刻
+        #    例：t0=10:00, coarse_td=2h -> decision=12:00
+        block_start = pd.to_datetime(features_df.index)
+        decision_timestamps = block_start + coarse_td
+
+        # 3) current_data_timestamps = decision - rolling_step：
+        #    在 open_time 索引下，decision 对应的是“下一根K线的起点”，
+        #    因此当前可用价格应取上一根已收盘K线的 close，避免前视泄露
+        #    例：rolling_step=15min -> current_data_timestamp=11:45（取11:45这根K线的close）
+        current_data_timestamps = decision_timestamps - rolling_step_td
+        # 4) prediction_timestamps = 未来预测终点（物理时间）
+        #    例：prediction_horizon_td=2h -> prediction_timestamps=14:00
+        prediction_timestamps = decision_timestamps + prediction_horizon_td
+        # 5) prediction_data_timestamps = prediction_end - rolling_step：
+        #    与当前价同理，取未来终点前一根已收盘K线的 close 作为标签分子
+        #    例：prediction_data_timestamp=13:45（取13:45这根K线的close）
+        prediction_data_timestamps = prediction_timestamps - rolling_step_td
+
+        t_prices = z_raw['c'].reindex(current_data_timestamps)
+        o_prices = z_raw['o'].reindex(current_data_timestamps)
+        t_future_prices = z_raw['c'].reindex(prediction_data_timestamps)
+
+        return_p = t_future_prices.values / t_prices.values
+        return_f = np.log(return_p)
+
+        features_df['feature_offset'] = offset.total_seconds() / 60.0
+        features_df['decision_timestamps'] = decision_timestamps
+        features_df['current_data_timestamps'] = current_data_timestamps
+        features_df['prediction_timestamps'] = prediction_timestamps
+        features_df['prediction_data_timestamps'] = prediction_data_timestamps
+        features_df['t_price'] = t_prices.values
+        features_df['t_future_price'] = t_future_prices.values
+        features_df['o_price'] = o_prices.values
+        features_df['return_f'] = return_f
+        features_df['return_p'] = return_p
+
+        # 统一把索引设为决策时刻，后续切分按该锚点执行
+        features_df.index = decision_timestamps
+
+        valid_mask = (
+            ~np.isnan(features_df['return_f']) &
+            ~np.isnan(features_df['t_price']) &
+            ~np.isnan(features_df['t_future_price'])
+        )
+        features_df = features_df[valid_mask]
+        samples.append(features_df)
+
+        print(f"  ✓ 样本数: {len(features_df)}")
+
+    if len(samples) == 0:
+        raise ValueError("未生成有效样本，请检查时间范围与参数设置")
+
+    # ========== 第四步：合并样本并做标签标准化 ==========
+    df_samples = pd.concat(samples, axis=0, ignore_index=False, copy=False)
+    if df_samples.index.duplicated().any():
+        dup_cnt = int(df_samples.index.duplicated().sum())
+        df_samples = df_samples[~df_samples.index.duplicated(keep='first')]
+        print(f"发现重复决策时间戳 {dup_cnt} 个，已按 first 去重")
+    df_samples.sort_index(inplace=True)
+
+    # 因果滚动zscore：仅使用当前及历史收益，不使用未来信息
+    ret_series = pd.Series(df_samples['return_f'].values, index=df_samples.index)
+    rolling_mean = ret_series.rolling(window=rolling_w, min_periods=rolling_w).mean()
+    rolling_std = ret_series.rolling(window=rolling_w, min_periods=rolling_w).std(ddof=0)
+    df_samples['ret_rolling_zscore'] = (ret_series - rolling_mean) / rolling_std.replace(0.0, np.nan)
+
+    if remove_warmup_rows:
+        before_len = len(df_samples)
+        df_samples = df_samples.dropna(subset=['ret_rolling_zscore'])
+        print(f"删除rolling预热期后: {before_len} -> {len(df_samples)}")
+    else:
+        df_samples = df_samples.dropna(subset=['return_f', 'ret_rolling_zscore'])
+
+    # ========== 第五步：按决策时刻切分训练/测试 ==========
+    # 训练样本要求其标签终点不超过训练区间结束
+    effective_end_train = pd.to_datetime(end_date_train) - prediction_horizon_td
+    train_mask = (df_samples.index >= pd.to_datetime(start_date_train)) & \
+                 (df_samples.index <= effective_end_train)
+    test_mask = (df_samples.index >= pd.to_datetime(start_date_test)) & \
+                (df_samples.index <= pd.to_datetime(end_date_test))
+
+    exclude_cols = [
+        't_price', 'o_price', 't_future_price', 'return_p', 'return_f',
+        'prediction_timestamps', 'prediction_data_timestamps',
+        'ret_rolling_zscore', 'feature_offset', 'decision_timestamps',
+        'current_data_timestamps'
+    ]
+    feature_cols = [col for col in df_samples.columns if col not in exclude_cols]
+
+    X_all = df_samples[feature_cols]
+    X_train = df_samples.loc[train_mask, feature_cols]
+    X_test = df_samples.loc[test_mask, feature_cols]
+
+    y_train = df_samples.loc[train_mask, 'ret_rolling_zscore']
+    y_test = df_samples.loc[test_mask, 'ret_rolling_zscore']
+    ret_train = df_samples.loc[train_mask, 'return_f']
+    ret_test = df_samples.loc[test_mask, 'return_f']
+    y_p_train_origin = df_samples.loc[train_mask, 'return_p']
+    y_p_test_origin = df_samples.loc[test_mask, 'return_p']
+
+    open_train = df_samples.loc[train_mask, 'o_price']
+    close_train = df_samples.loc[train_mask, 't_price']
+    open_test = df_samples.loc[test_mask, 'o_price']
+    close_test = df_samples.loc[test_mask, 't_price']
+    feature_names = feature_cols
+
+    train_index = df_samples.index[train_mask]
+    test_index = df_samples.index[test_mask]
+
+    if output_format == 'ndarry':
+        X_all = X_all.values
+        X_train = X_train.values
+        X_test = X_test.values
+    else:
+        raise ValueError(f"output_format 应为 'ndarry' 或 'dataframe'，当前为 {output_format}")
+
+    ohlc_aligned = pd.DataFrame(
+        {'c': df_samples['t_price'], 'close': df_samples['t_price']},
+        index=df_samples.index
+    )
+
+    print("检查输出形状:")
+    print(f"X_all: {X_all.shape}, X_train: {X_train.shape}, X_test: {X_test.shape}")
+    print(f"y_train: {y_train.shape}, y_test: {y_test.shape}")
+    print(f"train_index: {train_index.min() if len(train_index) else None} -> {train_index.max() if len(train_index) else None}")
+    print(f"test_index: {test_index.min() if len(test_index) else None} -> {test_index.max() if len(test_index) else None}")
+
+    return (X_all, X_train, y_train, ret_train, X_test, y_test, ret_test,
+            feature_names, open_train, open_test, close_train, close_test,
+            df_samples.index, ohlc_aligned, y_p_train_origin, y_p_test_origin,
+            train_index, test_index)
+
 # 应用滚动标准化到标签
 def norm_ret(x, window=2000):
     x = np.log1p(np.asarray(x))

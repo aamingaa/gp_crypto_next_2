@@ -125,7 +125,7 @@ class GPAnalyzer:
                  self.open_train, self.open_test, self.close_train, self.close_test,
                  self.z_index, self.ohlc, self.y_p_train_origin, self.y_p_test_origin,
                  self.train_index, self.test_index
-                 ) = dataload.data_prepare_coarse_grain_rolling_offset(
+                 ) = dataload.data_prepare_coarse_grain_rolling_offset_v2(
                     self.sym, self.freq, self.start_date_train, self.end_date_train,
                     self.start_date_test, self.end_date_test, 
                     coarse_grain_period=getattr(self, 'coarse_grain_period', '2h'),
