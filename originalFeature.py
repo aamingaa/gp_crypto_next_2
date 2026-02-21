@@ -129,8 +129,8 @@ def define_base_fields(rolling_zscore_window: int = 2000, include_categories: Li
     
 
     return {
-        'lgp_shortcut_illiq_6': lambda data: norm(np.nan_to_num(pd.Series(2*(data['h'] - data['l']) - np.abs(data['c'] - data['o'])).rolling(6, min_periods=1).apply(lambda x: x.mean()))),
-        # 'h_ts_std_10': lambda data: norm(np.nan_to_num(pd.Series(data['h']).rolling(window=10, min_periods=5).std())),
+        # 'lgp_shortcut_illiq_6': lambda data: norm(np.nan_to_num(pd.Series(2*(data['h'] - data['l']) - np.abs(data['c'] - data['o'])).rolling(6, min_periods=1).apply(lambda x: x.mean()))),
+        'h_ts_std_10': lambda data: norm(np.nan_to_num(pd.Series(data['h']).rolling(window=10, min_periods=5).std())),
         # 'v_ta_cmo_25': lambda data: norm(talib.CMO(data['vol'], 25)),
         # 'v_ts_argrange_10': lambda data: norm(np.nan_to_num(pd.Series(data['vol']).rolling(window=10, min_periods=5).apply(np.argmax) + 1) - np.nan_to_num(pd.Series(data['vol']).rolling(window=10, min_periods=5).apply(np.argmin) + 1)),
         # 'c_ts_argrange_10': lambda data: norm(np.nan_to_num(pd.Series(data['c']).rolling(window=10, min_periods=5).apply(np.argmax) + 1) - np.nan_to_num(pd.Series(data['c']).rolling(window=10, min_periods=5).apply(np.argmin) + 1)),

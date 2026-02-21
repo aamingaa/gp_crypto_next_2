@@ -536,14 +536,14 @@ def data_prepare_coarse_grain_rolling_offset_v2(
         #    在 open_time 索引下，decision 对应的是“下一根K线的起点”，
         #    因此当前可用价格应取上一根已收盘K线的 close，避免前视泄露
         #    例：rolling_step=15min -> current_data_timestamp=11:45（取11:45这根K线的close）
-        current_data_timestamps = decision_timestamps - rolling_step_td
+        current_data_timestamps = decision_timestamps
         # 4) prediction_timestamps = 未来预测终点（物理时间）
         #    例：prediction_horizon_td=2h -> prediction_timestamps=14:00
         prediction_timestamps = decision_timestamps + prediction_horizon_td
         # 5) prediction_data_timestamps = prediction_end - rolling_step：
         #    与当前价同理，取未来终点前一根已收盘K线的 close 作为标签分子
         #    例：prediction_data_timestamp=13:45（取13:45这根K线的close）
-        prediction_data_timestamps = prediction_timestamps - rolling_step_td
+        prediction_data_timestamps = prediction_timestamps
 
         t_prices = z_raw['c'].reindex(current_data_timestamps)
         o_prices = z_raw['o'].reindex(current_data_timestamps)
@@ -564,7 +564,7 @@ def data_prepare_coarse_grain_rolling_offset_v2(
         features_df['return_p'] = return_p
 
         # 统一把索引设为决策时刻，后续切分按该锚点执行
-        features_df.index = decision_timestamps
+        # features_df.index = decision_timestamps
 
         valid_mask = (
             ~np.isnan(features_df['return_f']) &
