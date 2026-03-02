@@ -12,7 +12,7 @@ the computer programs created by the :mod:`gplearn.genetic` module.
 import numbers
 import numpy as np
 from joblib import wrap_non_picklable_objects
-from scipy.stats import rankdata,pearsonr,spearmanr
+from scipy.stats import rankdata,pearsonr,spearmanr, wasserstein_distance
 import pandas as pd
 import numpy as np
 from sklearn.linear_model import LinearRegression
@@ -363,6 +363,95 @@ def _calculate_given_range_ic(y, y_pred, w, up_r, dn_r, method='spearman'):
    
     return corr
 
+def _risk_constrained_chunk(y, y_pred, w, n_chunk=5):
+    """
+    适配时序因子挖掘的风险约束fitness函数
+    核心逻辑：fitness = 时序预测收益能力 - 加权风险惩罚（越大越好）
+    输入：
+        y: 一维数组，真实的时序收益率（t+1时刻）
+        y_pred: 一维数组，因子值（t时刻），即时序预测信号
+        w: 样本权重，默认不用
+    输出：
+        标量fitness得分，越大越好（无效因子返回-∞）
+    """
+
+    # -------------------------- 1. 时序收益基础项（核心） --------------------------
+    # 时序因子核心评价：方向准确率 + 收益贡献（兼顾胜率和盈亏比）
+    # a. 方向准确率：预测方向与实际收益方向一致的比例
+    dir_correct = np.sum((y_pred > 0) == (y > 0)) / len(y)
+    # b. 收益贡献：预测值与真实收益的相关系数（放大正确方向的收益权重）
+    corr, _ = pearsonr(y_pred, y)
+    corr = 0 if np.isnan(corr) else corr
+    # c. 基础得分：方向准确率*（1+相关系数），归一化到[0,1]
+    base_score = dir_correct * (1 + abs(corr)) / 2  # 范围[0,1]
+
+    # -------------------------- 2. 时序分布一致性惩罚pen_EMD（跨窗口稳定性） --------------------------
+    # 适配逻辑：将时间序列切分为3个滚动窗口，用EMD衡量因子预测分布的差异（差异大=惩罚重）
+    try:
+        # 切分滚动窗口（保证每个窗口至少10个样本）
+        np.array_split(y_pred, n_chunk)
+
+        y_pre_segments = np.array_split(y_pred, n_chunk)
+        y_segments = np.array_split(y, n_chunk)
+
+        emd_list = []
+
+        for y_pre_segment, y_segment in zip(y_pre_segments, y_segments):
+            emd = wasserstein_distance(y_pre_segment, y_segment)
+            emd = 0 if np.isnan(emd) else emd
+            emd_list.append(emd)
+
+        emd_list_np = np.array(emd_list)
+        avg_emd = np.nanmean(emd_list_np)
+        
+        # 归一化：用因子值的全距作为最大EMD，将惩罚归一到[0,1]
+        emd_max = np.ptp(y_pred)  # 全距=最大值-最小值
+        pen_EMD = avg_emd / emd_max if emd_max > 1e-8 else 1.0
+    except:
+        pen_EMD = 1.0  # 计算异常则满额惩罚
+
+    # -------------------------- 3. 时序尾部风险惩罚pen_tail（极端时段失效） --------------------------
+    # a. 定义时序极端行情窗口
+    extreme_thresh = 0.02  # 涨/跌超2%视为极端行情
+    extreme_mask = (y > extreme_thresh) | (y < -extreme_thresh)
+    
+    if extreme_mask.sum() < 5:  # 极端样本不足，不惩罚
+        pen_tail = 0.0
+    else:
+        # 极端行情下的方向准确率（越低，惩罚越重）
+        extreme_dir_correct = np.sum((y_pred[extreme_mask] > 0) == (y[extreme_mask] > 0)) / extreme_mask.sum()
+        # 平方项放大极端失效的惩罚，归一到[0,1]
+        pen_tail = (1 - extreme_dir_correct) ** 2
+        
+    # -------------------------- 4. 时序回撤惩罚pen_MDD（持仓净值回撤） --------------------------
+    # 适配逻辑：模拟因子时序持仓的净值曲线，计算最大回撤（回撤大=惩罚重）
+    try:
+        # 时序持仓逻辑：因子值>0做多，<0做空，仓位大小=因子值归一化后的绝对值
+        norm_pred = y_pred / np.max(np.abs(y_pred))  # 仓位归一到[-1,1]
+        portfolio_return = norm_pred * y  # 每日持仓收益=仓位*实际收益率
+        # 计算净值曲线和最大回撤
+        net_value = np.cumprod(1 + portfolio_return)
+        peak = np.maximum.accumulate(net_value)  # 滚动峰值
+        drawdown = (peak - net_value) / peak  # 回撤率
+        max_dd = drawdown.max()
+        pen_MDD = min(max_dd, 1.0)  # 归一到[0,1]
+    except:
+        pen_MDD = 1.0  # 计算异常则满额惩罚
+
+    # -------------------------- 5. 融合所有项，输出最终fitness --------------------------
+    # 时序场景的惩罚权重（可根据需求调整）
+    w_EMD = 0.25   # 跨窗口分布稳定性（时序核心约束）
+    w_tail = 0.25  # 极端时段失效惩罚
+    w_MDD = 0.2    # 时序回撤惩罚
+
+    # 总fitness = 基础收益项 - 加权总惩罚（保证非负，无效因子返回-∞）
+    total_penalty = w_EMD * pen_EMD + w_tail * pen_tail + w_MDD * pen_MDD
+    final_fitness = base_score - total_penalty
+
+    # 边界处理：fitness<0视为无效因子，直接淘汰
+    final_fitness = final_fitness if final_fitness > 0 else -np.inf
+    return final_fitness
+
 
 # --------------------------需要原始y的评价函数-----------------------------------
 
@@ -539,6 +628,8 @@ max_ic_train = _Fitness(function= _calculate_max_ic_chunk_train,
 given_ic_test = _Fitness(function= _calculate_given_range_ic,
                             greater_is_better=True)
 
+risk_constrained_chunk = _Fitness(function=_risk_constrained_chunk,
+                            greater_is_better=True)
 
 
 #辅助计算指标
