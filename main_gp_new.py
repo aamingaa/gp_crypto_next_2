@@ -529,23 +529,34 @@ class GPAnalyzer:
         # 读取因子值
         z = pd.read_csv(csv_path)
 
-        # 遍历每一个因子，如果符合条件，就加入elite pool中
-        for index,row in z.iterrows():
-            '''
-            此处写筛选因子的逻辑
-            
-            '''
-            cond1 = (row['fitness_sharp_train'] > 2)
-            cond2 = (row['fitness_sharp_test'] > 2)  
-            cond3 = (row['fitness_avg_pic_train'] > 0.005)
-            cond4 = (row['fitness_avg_pic_test'] > 0.005)
-            try:
-                # 这里写入筛选因子的逻辑，根据不同的metric筛选出因子池，进行拟合
-                if cond1 and cond2 and cond3 and cond4:
-                    # 记录符合标准的expression
-                    elite_pool.append(row['expression'])
-            except Exception as e:
-                    print(f'an error occurred with {e}')
+        # 统一改为分位数筛选：每个指标都取该批因子前10%（P90）阈值，再取交集
+        metric_cols = [
+            'fitness_sharp_train',
+            'fitness_sharp_test',
+            'fitness_avg_pic_train',
+            'fitness_avg_pic_test'
+        ]
+        available_metric_cols = [col for col in metric_cols if col in z.columns]
+        missing_cols = [col for col in metric_cols if col not in z.columns]
+        if missing_cols:
+            print(f"缺少如下指标列，已跳过这些列: {missing_cols}")
+        if not available_metric_cols:
+            print("没有可用于筛选的指标列，返回空因子池。")
+            return elite_pool
+
+        valid_z = z.dropna(subset=available_metric_cols).copy()
+        if valid_z.empty:
+            print("可用于筛选的样本为空（指标列全是缺失值），返回空因子池。")
+            return elite_pool
+
+        thresholds = {col: valid_z[col].quantile(0.9) for col in available_metric_cols}
+
+        mask = pd.Series(True, index=valid_z.index)
+        for col in available_metric_cols:
+            mask &= (valid_z[col] >= thresholds[col])
+
+        elite_pool = valid_z.loc[mask, 'expression'].dropna().astype(str).tolist()
+        print(f"分位数阈值（前10%）: {thresholds}")
         elite_pool_size = len(elite_pool)
         print(f'挑选出来{self.sym}的因子池数量{elite_pool_size}')
         return elite_pool
