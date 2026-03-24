@@ -170,7 +170,7 @@ def inverse_norm(normalized_data, original_data, window=2000):
    
     return result
 
-def verify_inverse_transform(original_data, normalized_data, window=2000, is_plot=False):
+def verify_inverse_transform(original_data, normalized_data, window=2000, is_plot=False, step=1):
     """
     验证逆变换的准确性
     参数:
@@ -238,9 +238,10 @@ def verify_inverse_transform(original_data, normalized_data, window=2000, is_plo
         plt.grid(True)
         
         plt.tight_layout()
-        plt.show()
+        plt.savefig(f'/Users/aming/project/python/gp_crypto_next_2/picture/verify_inverse_{window}_{step}.png', dpi=150)
+        # plt.show()
 
-def check_quantile_consistency(original_data, normalized_data, window=2000, is_plot=False):
+def check_quantile_consistency(original_data, normalized_data, window=2000, is_plot=False, step=1):
     """
     检查原始数据和归一化后数据的分位数对应关系
     """
@@ -271,19 +272,19 @@ def check_quantile_consistency(original_data, normalized_data, window=2000, is_p
     pos_mask = original > 0
     neg_mask = original < 0
     
-    # print("\n正值分位数：")
-    # print(pd.DataFrame({
-    #     'Quantile': quantiles,
-    #     'Original': np.quantile(original[pos_mask], quantiles),
-    #     'Normalized': np.quantile(normalized[pos_mask], quantiles)
-    # }))
+    print("\n正值分位数：")
+    print(pd.DataFrame({
+        'Quantile': quantiles,
+        'Original': np.quantile(original[pos_mask], quantiles),
+        'Normalized': np.quantile(normalized[pos_mask], quantiles)
+    }))
     
-    # print("\n负值分位数：")
-    # print(pd.DataFrame({
-    #     'Quantile': quantiles,
-    #     'Original': np.quantile(original[neg_mask], quantiles),
-    #     'Normalized': np.quantile(normalized[neg_mask], quantiles)
-    # }))
+    print("\n负值分位数：")
+    print(pd.DataFrame({
+        'Quantile': quantiles,
+        'Original': np.quantile(original[neg_mask], quantiles),
+        'Normalized': np.quantile(normalized[neg_mask], quantiles)
+    }))
     
     if is_plot:
         # 可视化
@@ -303,7 +304,9 @@ def check_quantile_consistency(original_data, normalized_data, window=2000, is_p
         plt.legend()
         plt.title('distributions')
         plt.tight_layout()
-        plt.show()
+
+        plt.savefig(f'/Users/aming/project/python/gp_crypto_next_2/picture/quantile_consistency_{window}_{step}.png', dpi=150)
+        # plt.show()
 
 def evaluate_position_performance(data, label_col, window=2000, fee_rate=0.0004, is_plot=False):
     """
@@ -393,70 +396,82 @@ def _generate_date_range(start_date, end_date):
     return date_list
 
 
-# start = time.time()
-# # file_path = 'H:/QuantofKL/CryptosFuturesModel/raw_data/DOGEUSDT_1h_250108.pkl'
-# start_date = '2025-01'
-# end_date = '2025-03'
-# df_list = []
-# date_list = _generate_date_range(start_date, end_date)
-# raw_data = []
-# for date in date_list:
-#     file_path = f'/Volumes/Ext-Disk/data/futures/um/monthly/klines/ETHUSDT/1h/2025/ETHUSDT-1h-{date}.zip'
-#     df = pd.read_csv(file_path)
-#     # df['date'] = date
-#     df_list.append(df)
-#     print(f'df{len(df)}, read df_list {len(df_list)} done')
+start = time.time()
+# file_path = 'H:/QuantofKL/CryptosFuturesModel/raw_data/DOGEUSDT_1h_250108.pkl'
+start_date = '2025-01'
+end_date = '2025-08'
+df_list = []
+date_list = _generate_date_range(start_date, end_date)
+raw_data = []
+for date in date_list:
+    file_path = f'/Users/aming/data/ETHUSDT/1h/ETHUSDT-1h-{date}.zip'
+    df = pd.read_csv(file_path)
+    # df['date'] = date
+    df_list.append(df)
+    print(f'df{len(df)}, read df_list {len(df_list)} done')
 
-# raw_data = pd.concat(df_list)
-# # raw_data = pd.read_csv(file_path)
-# raw_data['ret'] = (raw_data['close'].shift(-1) / raw_data['close'] - 1).fillna(0)
-# # raw_data['ret'] = (raw_data['close'] / raw_data['close'].shift(1) - 1).fillna(0)
-# range_start = 5
-# range_end = 15
+raw_data = pd.concat(df_list)
+# raw_data = pd.read_csv(file_path)
+raw_data['ret'] = (raw_data['close'].shift(-1) / raw_data['close'] - 1).fillna(0)
+# raw_data['ret'] = (raw_data['close'] / raw_data['close'].shift(1) - 1).fillna(0)
+range_start = 5
+range_end = 15
 
-# window_list = [100, 200, 300, 500, 800, 1000, 1200, 1500, 1800, 2000, 2500, 3000]
+window_list = [100, 200, 300, 500, 800, 1000, 1200, 1500, 1800, 2000, 2500, 3000]
 # window_list = [100, 500, 1000, 2000]
 # window_list = [100, 200, 300, 500]
-# for window in window_list:
-#     for i in range(range_start, range_end, 2):
-#         print(f'Start of step {i} at window {window}')
-#         raw_data[f'ret_{i}'] = (raw_data['close'].shift(-i) / raw_data['close'] - 1).fillna(0)
-#         print(f'mean of term {i} with norm window of {window} cumsum of returns')
-#         print(f'mean of term {i} with norm window of {window} absolute return values is {raw_data[f"ret_{i}"].abs().mean()}')
-#         print(raw_data[f"ret_{i}"].describe())
-#         raw_data[f'ret_{i}_norm'] = norm(raw_data[f'ret_{i}'].values, window=window, clip=6)
+# window_list = [100]
+performance_records = []
+for window in window_list:
+    for i in range(range_start, range_end, 2):
+        print(f'Start of step {i} at window {window}')
+        raw_data[f'ret_{i}'] = (raw_data['close'].shift(-i) / raw_data['close'] - 1).fillna(0)
+        print(f'mean of term {i} with norm window of {window} cumsum of returns')
+        print(f'mean of term {i} with norm window of {window} absolute return values is {raw_data[f"ret_{i}"].abs().mean()}')
+        print(raw_data[f"ret_{i}"].describe())
+        raw_data[f'ret_{i}_norm'] = norm(raw_data[f'ret_{i}'].values, window=window, clip=6)
 
 
-#         print(f"\n检查 ret_{i} 且norm 的window为{window}的逆变换效果:")
-#         print('1==Norm之后的变号状况及变号部分return的分布')
-#         raw_data[f'ret_{i}_direct_inequals'] = np.where(raw_data[f'ret_{i}'] * raw_data[f'ret_{i}_norm'] < 0, 0, 1)
-#         print(f'step为{i}且window为{window}时，直接变号比例为',  1 - raw_data[f'ret_{i}_direct_inequals'].sum()/len(raw_data), '形状参数如下：')
-#         print(raw_data[raw_data[f'ret_{i}_direct_inequals'] == 0][f'ret'].describe())
+        # print(f"\n检查 ret_{i} 且norm 的window为{window}的逆变换效果:")
+        # print('1==Norm之后的变号状况及变号部分return的分布')
+        # raw_data[f'ret_{i}_direct_inequals'] = np.where(raw_data[f'ret_{i}'] * raw_data[f'ret_{i}_norm'] < 0, 0, 1)
+        # print(f'step为{i}且window为{window}时，直接变号比例为',  1 - raw_data[f'ret_{i}_direct_inequals'].sum()/len(raw_data), '形状参数如下：')
+        # print(raw_data[raw_data[f'ret_{i}_direct_inequals'] == 0][f'ret'].describe())
 
-#         verify_inverse_transform(
-#             raw_data[f'ret_{i}'].values,
-#             raw_data[f'ret_{i}_norm'].values,
-#             window=2000,
-#             is_plot=False
-#         )
+        # verify_inverse_transform(
+        #     raw_data[f'ret_{i}'].values,
+        #     raw_data[f'ret_{i}_norm'].values,
+        #     window=window,
+        #     is_plot=False,
+        #     step=i
+        # )
 
-#         check_quantile_consistency(
-#             raw_data[f'ret_{i}'].values,
-#             raw_data[f'ret_{i}_norm'].values,
-#             window=2000,
-#             is_plot=False
-#         )
+        # check_quantile_consistency(
+        #     raw_data[f'ret_{i}'].values,
+        #     raw_data[f'ret_{i}_norm'].values,
+        #     window=window,
+        #     is_plot=True,
+        #     step=i
+        # )
 
-#         print(f"\n评估 ret_{i}_norm且window为{window}的表现:")
-#         performance = evaluate_position_performance(
-#             raw_data, 
-#             f'ret_{i}_norm',
-#             window=window,
-#             is_plot=False
-#         )
-        
-#         for metric, value in performance.items():
-#             print(f"{metric}: {value:.4f}")
-#         print(f'End of step {i} at window {window} \n\n')
+        print(f"\n评估 ret_{i}_norm且window为{window}的表现:")
+        performance = evaluate_position_performance(
+            raw_data, 
+            f'ret_{i}_norm',
+            window=window,
+            is_plot=False
+        )
+        row = {'window': window, 'step': i}
+        row.update(performance)
+        performance_records.append(row)
 
-# print(f'time cost :{time.time() - start}S')
+        # for metric, value in performance.items():
+        #     print(f"{metric}: {value:.4f}")
+        print(f'End of step {i} at window {window} \n\n')
+
+if performance_records:
+    perf_csv_path = '/Users/aming/project/python/gp_crypto_next_2/picture/perf.csv'
+    pd.DataFrame(performance_records).to_csv(perf_csv_path, index=False, encoding='utf-8-sig')
+    print(f'性能指标已保存: {perf_csv_path}')
+
+print(f'time cost :{time.time() - start}S')
