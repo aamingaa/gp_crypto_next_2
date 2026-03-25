@@ -1,8 +1,8 @@
+from datetime import datetime
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-
-import plotly.express as px
-import plotly.graph_objects as go
 
 
 def cusum_filter(series: pd.Series, threshold: float) -> pd.DatetimeIndex:
@@ -40,6 +40,47 @@ def cusum_filter(series: pd.Series, threshold: float) -> pd.DatetimeIndex:
             t_events.append(t)
 
     return pd.DatetimeIndex(t_events)
+
+
+def prepare_close_for_cusum(close: pd.Series, use_log: bool = True):
+    """
+    整理 close，并给出传入 cusum_filter 的序列（默认 log(close)）。
+    返回 (close, base)。
+    """
+    close = pd.Series(close, copy=True).astype(float)
+    close = close.sort_index()
+    close = close[~close.index.duplicated(keep="last")]
+    base = np.log(close) if use_log else close
+    return close, base
+
+
+def add_cusum_threshold_markers(
+    ax,
+    close: pd.Series,
+    base: pd.Series,
+    threshold: float,
+    *,
+    color=None,
+    label=None,
+):
+    """
+    在已有 axes 上为单个 threshold 绘制 CUSUM 触发点（与 prepare_close_for_cusum + cusum_filter 配合）。
+    """
+    events = cusum_filter(base, float(threshold))
+    y = close.reindex(events, method="ffill")
+    lbl = label if label is not None else f"th={threshold} (n={len(events)})"
+    ax.scatter(
+        events,
+        y.values,
+        s=40,
+        marker="D",
+        color=color,
+        edgecolors="white",
+        linewidths=0.5,
+        zorder=3,
+        label=lbl,
+    )
+
 
 def cusum_filter_side(series: pd.Series, threshold: float) -> pd.DatetimeIndex:
     """
@@ -308,377 +349,71 @@ def get_barrier_fast(close, enter, pt_sl, max_holding, target=None, side=None):
         
     return out_df
 
-def grid_pt_sl(pt,sl,close,enter,max_holding,side):
-    """
-    :param pt: list of profit taking target rate
-    :param sl: list of stop loss target rate
-    :return: (pd.DataFrame) Cumulative Returns of each pt_sl
-            row = profit taking target rate, columns = stop loss target rate
-    """
-    out = np.ones((len(pt),len(sl)))
-    df = pd.DataFrame(out)
-    df.index = pt
-    df.columns = sl
-    for i in pt:
-        for j in sl:
-            pt_sl = [i,j]
-            df.loc[i,j] = get_barrier_fast(close,enter,pt_sl,max_holding,side).ret.cumsum()[-1]
-    return df
 
-def get_wallet(close, barrier, initial_money=0, bet_size=None):
-    """
-    :param close: series of price
-    :param barrier: DataFrame from get_barrier()
-                barrier must include column 'exit'
-    :return: (pd.DataFrame) Cumulative Returns of each pt_sl
-            row = profit taking target rate, columns = stop loss target rate
-    """
-    close = close.round(2)
-    if bet_size is None:
-        bet_size = pd.Series(np.ones(len(close)),index=close.index)
-    bet_amount = bet_size.loc[barrier.index]
-    spend = bet_amount*close.loc[barrier.index]
-    receive = pd.Series(close.loc[barrier.exit.dropna()].values, index=barrier.dropna(subset=['exit']).index)*bet_amount
-    receive = receive.fillna(0)
-    close_exit = pd.Series(receive.loc[barrier.index].values,index=barrier.exit).groupby(by='exit',axis=0).sum()
-    close_exit = close_exit.rename('money_receive')
-    
-    wallet_0 = pd.DataFrame({'exit':barrier.exit,'price':close,'money_spent':spend})
-    wallet = wallet_0.join(close_exit).fillna(0)
-    wallet = wallet.drop(index= wallet.loc[wallet.money_spent+wallet.money_receive==0].index)
-    
-    buy_amount = bet_amount
-    buy_amount = buy_amount.rename('buy_amount')
-    sell_amount = (wallet.money_receive/wallet.price).round()
-    sell_amount = sell_amount.rename('sell_amount')
-    
-    n_stock = ((wallet.money_spent/wallet.price).round()-(wallet.money_receive/wallet.price).round()).cumsum()
-    n_stock = n_stock.rename('n_stock')
-    
-    inventory = (-wallet.money_spent+wallet.money_receive).cumsum() + initial_money
-    inventory = inventory.rename('cash_inventory')
-    
-    out = wallet.join([buy_amount,sell_amount,n_stock,inventory])
-    out = out.fillna(0)
-    return out
+def _generate_date_range(start_date, end_date):
+    start = datetime.strptime(start_date, '%Y-%m')
+    end = datetime.strptime(end_date, '%Y-%m')
+    date_list = []
+    current_dt = start
+    while current_dt <= end:
+        date_list.append(current_dt.strftime('%Y-%m'))
+        # current += timedelta(days=1)
+        if current_dt.month == 12:
+                current_dt = current_dt.replace(year=current_dt.year + 1, month=1)
+        else:
+                current_dt = current_dt.replace(month=current_dt.month + 1)
+    return date_list
 
 
-def get_wallet_v2(close, barrier, initial_money=10000, bet_size=None, fee_rate=0.0006, slippage=0.0001):
-    """
-    高度可靠的钱包/持仓核算函数（针对 15min 加密货币回测优化）
-    
-    :param close: 原始价格序列 (pd.Series)
-    :param barrier: get_barrier 的输出 (pd.DataFrame)，必须包含 'exit' 列
-    :param initial_money: 初始账户现金
-    :param bet_size: 下注数量（单位：枚/个）。如果是 None，则默认为每笔交易 1 个单位
-    :param fee_rate: 单边手续费率 (0.0006 = 万六)
-    :param slippage: 滑点百分比 (0.0001 = 0.01%)
-    """
-    # 确保索引是 datetime 格式
-    close.index = pd.to_datetime(close.index)
-    barrier.index = pd.to_datetime(barrier.index)
-    
-    # 1. 准备下注数据
-    if bet_size is None:
-        bet_size = pd.Series(1.0, index=barrier.index)
+def _csv_df_to_close(df):
+    """ETH 1h CSV：open_time 或 timestamp(ms) + close/c -> 带时间索引的收盘价序列。"""
+    if "open_time" in df.columns:
+        idx = pd.to_datetime(df["open_time"], unit="ms")
+    elif "timestamp" in df.columns:
+        idx = pd.to_datetime(df["timestamp"], unit="ms")
     else:
-        bet_size = bet_size.loc[barrier.index]
-
-    # 2. 计算【买入】详情 (Entry)
-    # 考虑滑点后的买入成交价
-    buy_price = close.loc[barrier.index] * (1 + slippage)
-    # 总支出 = 成交额 + 手续费
-    money_spent = (bet_size * buy_price) * (1 + fee_rate)
-    
-    # 3. 计算【卖出】详情 (Exit)
-    # 仅处理有明确退出信号的交易
-    exited_mask = barrier['exit'].notna()
-    exit_times = pd.to_datetime(barrier.loc[exited_mask, 'exit'])
-    entry_times_of_exited = barrier.loc[exited_mask].index
-    
-    # 退出时的市场价
-    exit_market_prices = close.loc[exit_times].values
-    # 考虑滑点后的卖出成交价
-    sell_price = exit_market_prices * (1 - slippage)
-    # 总收入 = 成交额 - 手续费
-    money_received_vals = (bet_size.loc[entry_times_of_exited].values * sell_price) * (1 - fee_rate)
-    
-    # 4. 数据聚合 (处理同一时间戳可能存在的多笔交易)
-    # 买入聚合
-    entry_agg = pd.DataFrame({
-        'money_spent': money_spent,
-        'buy_units': bet_size
-    }).groupby(level=0).sum()
-    
-    # 卖出聚合 (注意：卖出动作发生在 exit_times)
-    exit_agg = pd.DataFrame({
-        'money_receive': money_received_vals,
-        'sell_units': bet_size.loc[entry_times_of_exited].values
-    }, index=exit_times).groupby(level=0).sum()
-    
-    # 5. 构建完整的时间序列账本
-    # 使用完整的 close.index 确保不遗漏任何时间点，这对 pyfolio 计算波动率至关重要
-    wallet = pd.DataFrame(index=close.index)
-    wallet = wallet.join(entry_agg).join(exit_agg).fillna(0)
-    
-    # 6. 计算核心指标 (Level 累积值)
-    # 当前持仓数量 (累加买入 - 累加卖出)
-    wallet['n_stock'] = (wallet['buy_units'] - wallet['sell_units']).cumsum()
-    
-    # 现金账户余额 (初始资金 - 支出 + 收入)
-    wallet['cash_inventory'] = (-wallet['money_spent'] + wallet['money_receive']).cumsum() + initial_money
-    
-    # 账户总价值 (Equity) = 现金 + 持仓市值
-    wallet['price'] = close
-    wallet['total_equity'] = wallet['cash_inventory'] + (wallet['n_stock'] * wallet['price'])
-    
-    # 7. 计算收益率 (Returns)
-    # pyfolio 需要的是每日收益率，这里先计算 15min 收益率
-    wallet['returns'] = wallet['total_equity'].pct_change().fillna(0)
-    
-    return wallet
-
-import pandas as pd
-import numpy as np
-
-def get_wallet_ratio_based_simple(close, barrier, bet_size=None, initial_money=10000, max_pos=1, fee_rate=0.0006, slippage=0.0001):
-    """
-    基于资金占比 (bet_size as ratio) 的回测系统 - 简化版
-    去掉 numpy 加速，使用原生 pandas .loc 查找，逻辑更直观
-    """
-    # 1. 数据清洗与索引格式化
-    close.index = pd.to_datetime(close.index)
-    barrier.index = pd.to_datetime(barrier.index)
-    
-    # 2. 处理 bet_size
-    # 如果没传，或者传入的是 None，构造一个全为 1.0 的 Series
-    if bet_size is None:
-        bet_size = pd.Series(1.0, index=barrier.index)
-    else:
-        bet_size.index = pd.to_datetime(bet_size.index)
-        # 确保 bet_size 覆盖 barrier 的索引，缺失填 1.0
-        bet_size = bet_size.reindex(barrier.index).fillna(1.0)
-
-    # 3. 初始化变量
-    current_cash = initial_money
-    current_pos = 0.0      # 当前持有的币数
-    
-    open_positions = []    # 持仓队列 [{'exit_time':..., 'units':...}]
-    real_trades = []       # 交易流水
-    
-    # 4. 遍历每一个买入信号
-    # 直接遍历 barrier 的索引
-    for t_entry in barrier.index:
-        
-        # 保护：如果信号时间不在 close 数据里，跳过
-        if t_entry not in close.index:
-            continue
-            
-        # 获取当前行数据
-        # 使用 .loc 直接查找，速度较慢但可读性高
-        t_exit = barrier.loc[t_entry, 'exit']
-        current_price = close.loc[t_entry]
-        
-        # --- A. 先处理卖出 (释放资金) ---
-        # 检查 open_positions 里是否有需要在此刻(或之前)平仓的
-        still_open = []
-        for pos in open_positions:
-            # 如果预定的卖出时间早于或等于当前时间，说明该卖了
-            if pos['exit_time'] <= t_entry:
-                exit_t = pos['exit_time']
-                
-                # 确定卖出价格
-                if exit_t in close.index:
-                    price_exit = close.loc[exit_t]
-                else:
-                    # 如果退出时间在K线图中找不到（比如停牌或数据缺失），用当前价兜底
-                    price_exit = current_price 
-                
-                # 执行卖出
-                sell_price = price_exit * (1 - slippage)
-                revenue = (pos['units'] * sell_price) * (1 - fee_rate)
-                
-                current_cash += revenue
-                current_pos -= pos['units']
-                
-                real_trades.append({
-                    'time': exit_t, 
-                    'type': 'sell', 
-                    'cash_delta': revenue, 
-                    'pos_delta': -pos['units']
-                })
-            else:
-                # 还没到时间，继续持有
-                still_open.append(pos)
-        
-        # 更新持仓列表
-        open_positions = still_open
-        
-        # --- B. 计算当前账户总权益 (Total Equity) ---
-        # 权益 = 现金 + 持仓市值 (用当前 entry 价格估算)
-        total_equity = current_cash + (current_pos * current_price)
-        
-        # --- C. 决定买入数量 ---
-        
-        # 1. 检查最大持仓单数限制
-        if len(open_positions) >= max_pos:
-            continue
-            
-        # 2. 获取本单计划占比 (Ratio)
-        ratio = bet_size.loc[t_entry]
-        
-        if ratio <= 0: continue
-        
-        # 3. 计算【目标交易金额】
-        # 逻辑：我有多少总身家 * 我想下注的百分比
-        target_money_to_spend = total_equity * ratio
-        
-        # 4. 计算【理论需要买入的单位数】
-        buy_price = current_price * (1 + slippage)
-        # 公式推导：花费 = 数量 * 单价 * (1+费率)  => 数量 = 花费 / (单价 * (1+费率))
-        target_units = target_money_to_spend / (buy_price * (1 + fee_rate))
-        
-        # 5. 【资金兜底检查】 (Reality Check)
-        # 就算你想买100万，但你现金只有50万，那你最多只能买50万
-        max_affordable_units = current_cash / (buy_price * (1 + fee_rate))
-        
-        # 最终下单数量取较小值 (理想 vs 现实)
-        final_units = min(target_units, max_affordable_units)
-        
-        # 过滤过小的碎股
-        if final_units < 0.000001:
-            continue
-            
-        # --- D. 执行买入 ---
-        cost = (final_units * buy_price) * (1 + fee_rate)
-        
-        current_cash -= cost
-        current_pos += final_units
-        
-        open_positions.append({
-            'exit_time': t_exit,
-            'units': final_units
-        })
-        
-        real_trades.append({
-            'time': t_entry, 
-            'type': 'buy',
-            'cash_delta': -cost, 
-            'pos_delta': final_units
-        })
-
-    # === 5. 数据聚合与输出 ===
-    # 如果没交易，直接返回空账本
-    if not real_trades:
-        empty_wallet = pd.DataFrame(index=close.index)
-        empty_wallet['total_equity'] = initial_money
-        return empty_wallet
-
-    # 聚合交易流水
-    df_trades = pd.DataFrame(real_trades)
-    # 按时间聚合现金和持仓变动
-    df_agg = df_trades.groupby('time')[['cash_delta', 'pos_delta']].sum()
-    
-    # 扩展到完整时间轴
-    wallet = pd.DataFrame(index=close.index)
-    wallet = wallet.join(df_agg).fillna(0)
-    
-    # 计算累计状态
-    wallet['cash_inventory'] = wallet['cash_delta'].cumsum() + initial_money
-    wallet['n_stock'] = wallet['pos_delta'].cumsum()
-    
-    # 计算总资产曲线
-    wallet['price'] = close
-    wallet['total_equity'] = wallet['cash_inventory'] + (wallet['n_stock'] * wallet['price'])
-    
-    # 计算收益率
-    wallet['returns'] = wallet['total_equity'].pct_change().fillna(0)
-    
-    return wallet
+        raise ValueError("CSV 需包含 open_time 或 timestamp 列")
+    col = "close" if "close" in df.columns else "c"
+    s = pd.Series(df[col].to_numpy(), index=idx)
+    return s.sort_index()[~s.index.duplicated(keep="last")]
 
 
-def show_results(wallet):
-    """
-    
+if __name__ == "__main__":
 
-    Parameters
-    ----------
-    wallet : dataframe from get_wallet()
+    start_date = '2025-01'
+    end_date = '2025-01'
+    df_list = []
+    date_list = _generate_date_range(start_date, end_date)
+    for date in date_list:
+        file_path = f'/Users/aming/data/ETHUSDT/1h/ETHUSDT-1h-{date}.zip'
+        df = pd.read_csv(file_path)
+        df_list.append(df)
+        print(f'df{len(df)}, read df_list {len(df_list)} done')
 
-    Returns
-    -------
-    show results
+    raw_data = pd.concat(df_list, ignore_index=True)
+    close = _csv_df_to_close(raw_data)
 
-    """
-    initial_invest = wallet.cash_inventory[0]+wallet.money_spent[0]
-    cash_in_hand = wallet.cash_inventory[-1]
-    stock_owned = wallet.n_stock[-1]
-    stock_price_now = wallet.price[-1]
-    total_asset = cash_in_hand + stock_owned*stock_price_now
-    total_gain = total_asset-initial_invest
-    total_return = total_gain/initial_invest
-    tcost = wallet.money_receive.sum() * 0.003 + 0 # 0.3% tax, no fee
-    
-    print("Your initial investment money : {}".format(initial_invest))
-    print("You now have cash : {}".format(cash_in_hand))
-    print("You now have n of stocks : {}".format(stock_owned))
-    print("Your total asset (cash+stock) now : {}".format(total_asset))
-    print("Total gain : {}".format(total_gain))
-    print("Transaction costs : {}".format(tcost))
-    print("Total profit : {}".format(total_gain-tcost))
+    use_log = True
+    close, base = prepare_close_for_cusum(close, use_log=use_log)
+    thresholds = [0.0005, 0.001, 0.002, 0.005, 0.01]
 
-def get_plot_wallet(close,barrier,wallet):
-    
-    plot_df = close.to_frame().join(barrier)
-    ret_abs = plot_df.ret.abs()
-    plot_df['ret_size']=ret_abs
-    ret_sign = np.sign(plot_df.ret)
-    dfret = ret_sign.to_frame()
-    dfret[dfret.ret==1] = 'profit'
-    dfret[dfret.ret==-1] = 'loss'
-    dfret[dfret.ret==0] = 'exit point'
-    plot_df['This bet is']=dfret.ret
-    plot_wallet = wallet.join(plot_df.dropna()[['This bet is','ret_size']])
-    plot_wallet = plot_wallet.reset_index()
-    plot_wallet = plot_wallet.fillna({'This bet is':'exit point','ret_size':0})
-    plot_wallet = plot_wallet.rename(columns={'timestamp':'Date'})
-    return plot_wallet
+    fig, ax = plt.subplots(figsize=(11, 5.5))
+    ax.plot(close.index, close.values, color="#333", lw=1.2, label="close")
+    colors = plt.cm.tab10.colors
+    for i, th in enumerate(thresholds):
+        add_cusum_threshold_markers(
+            ax, close, base, th, color=colors[i % len(colors)]
+        )
 
-def get_metalabel(barrier):
-    
-    """
-    Parameters
-    ----------
-    barrier : dataframe
-        from get_barrier()
+    subtitle = "CUSUM 序列: log(close)" if use_log else "CUSUM 序列: close"
+    ax.set_title(f"CUSUM 触发点（不同 threshold）\n{subtitle}")
+    ax.set_xlabel("时间")
+    ax.set_ylabel("价格")
+    ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left")
+    fig.tight_layout()
+    plt.show()
 
-    Returns
-    -------
-    series of meta-label (1 profit(go) 0 loss(pass))
-
-    """
-    retsign = np.sign(barrier.ret)
-    retsign = retsign.loc[retsign!=0]
-    out = .5*(retsign+1)
-    out = out.rename('label')
-    return out
-
-def plot(close,barrier,wallet):   
-    plot_wallet = get_plot_wallet(close,barrier,wallet)
-    initial_invest = wallet.cash_inventory[0]+wallet.money_spent[0]
-    cash_in_hand = wallet.cash_inventory[-1]
-    stock_owned = wallet.n_stock[-1]
-    stock_price_now = wallet.price[-1]
-    total_asset = cash_in_hand + stock_owned*stock_price_now
-    total_gain = total_asset-initial_invest
-    total_return = total_gain/initial_invest
-    
-    fig = px.scatter(plot_wallet, x="Date", y="price", size='buy_amount', color='This bet is'
-                     ,size_max=10, hover_data=['exit','n_stock','cash_inventory','money_spent','money_receive'],color_discrete_sequence=["red", "black", "blue"])
-    
-    fig.update_xaxes(ticklabelmode="period")
-    fig.update_layout(title_text='Now having cash + stock value = {}, Total gain = {}'.format(total_asset.round(2),(total_gain).round(2)))
-    fig.add_trace(go.Scatter(x=close.index, y=close, mode='lines', name="Close Price",opacity=0.4))
-    
-    fig.show()
-
+    # enter = cusum_filter(np.log(close), 0.002)
+    # pt_sl = [0.02, 0.02]
+    # max_holding = [0, 12]
+    # out = get_barrier(close, enter, pt_sl, max_holding)

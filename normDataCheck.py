@@ -8,39 +8,8 @@ import warnings
 warnings.filterwarnings('ignore')
 
 """
-NormDataCheck模块使用说明
-
-功能描述：
-    该模块用于验证和分析数据标准化(Normalization)处理的有效性，主要关注标准化周期对结果的影响。
-
-主要验证内容：
-1. 标准化周期(norm period)的选择评估
-   - 分析不同标准化周期对结果的影响
-   - 验证过小的标准化周期可能导致的结果符号改变问题
-   - 评估结果符号改变的比例
-
-使用方法：
-1. 导入模块：
-   from NormDataCheck import *
-
-2. 数据准备：
-   - 确保输入数据为pandas DataFrame格式
-   - 数据应包含必要的时间索引和待分析的数值列
-
-3. 参数设置：
-   - 设置不同的标准化周期进行对比
-   - 设定评估指标的阈值
-
-4. 结果分析：
-   - 观察不同周期下的标准化结果
-   - 统计符号改变的比例
-   - 选择最优的标准化周期
-
-注意事项：
-1. 标准化周期不宜过小，需要平衡周期长度和结果稳定性
-2. 建议结合具体业务场景选择合适的评估指标
-3. 数据预处理时注意处理异常值和缺失值
-
+NormDataCheck：高斯秩归一化、逆变换与仓位表现评估。
+详细 API 与 Skill 用法见同目录 normDataCheck.md。
 """
 
 def norm(data, window = 500, clip=6):
@@ -128,15 +97,9 @@ def vectorized_gauss_rank_norm(data, window=500, clip=6):
 
 def inverse_norm(normalized_data, original_data, window=2000):
     """
-    将标准化后的数据转换回原始分布的近似值
-   
-    参数:
-    - normalized_data: 标准化后的数据
-    - original_data: 原始数据序列
-    - window: 与norm函数使用的相同窗口大小
-   
-    返回:
-    - 还原后的数据序列
+    将标准化后的数据转换回原始分布的近似值。
+    默认回测 PnL（evaluate_position_performance）直接用归一化列与 ret，不经过本函数；
+    若要在原始尺度上做对比或自定义 PnL，再使用还原序列。详见 normDataCheck.md。
     """
     x = np.asarray(normalized_data)
     orig = np.asarray(original_data)
@@ -399,7 +362,7 @@ def _generate_date_range(start_date, end_date):
 start = time.time()
 # file_path = 'H:/QuantofKL/CryptosFuturesModel/raw_data/DOGEUSDT_1h_250108.pkl'
 start_date = '2025-01'
-end_date = '2025-08'
+end_date = '2025-01'
 df_list = []
 date_list = _generate_date_range(start_date, end_date)
 raw_data = []
