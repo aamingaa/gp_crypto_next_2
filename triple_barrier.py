@@ -61,13 +61,18 @@ def add_cusum_threshold_markers(
     threshold: float,
     *,
     color=None,
+    color_idx: int = 0,
+    cmap: str = "tab10",
     label=None,
 ):
     """
     在已有 axes 上为单个 threshold 绘制 CUSUM 触发点（与 prepare_close_for_cusum + cusum_filter 配合）。
     """
     events = cusum_filter(base, float(threshold))
-    y = close.reindex(events, method="ffill")
+    y = close.reindex(events)
+    if color is None:
+        cmap_obj = plt.get_cmap(cmap)
+        color = cmap_obj(color_idx % cmap_obj.N)
     lbl = label if label is not None else f"th={threshold} (n={len(events)})"
     ax.scatter(
         events,
@@ -365,18 +370,6 @@ def _generate_date_range(start_date, end_date):
     return date_list
 
 
-def _csv_df_to_close(df):
-    """ETH 1h CSV：open_time 或 timestamp(ms) + close/c -> 带时间索引的收盘价序列。"""
-    if "open_time" in df.columns:
-        idx = pd.to_datetime(df["open_time"], unit="ms")
-    elif "timestamp" in df.columns:
-        idx = pd.to_datetime(df["timestamp"], unit="ms")
-    else:
-        raise ValueError("CSV 需包含 open_time 或 timestamp 列")
-    col = "close" if "close" in df.columns else "c"
-    s = pd.Series(df[col].to_numpy(), index=idx)
-    return s.sort_index()[~s.index.duplicated(keep="last")]
-
 
 if __name__ == "__main__":
 
@@ -391,29 +384,5 @@ if __name__ == "__main__":
         print(f'df{len(df)}, read df_list {len(df_list)} done')
 
     raw_data = pd.concat(df_list, ignore_index=True)
-    close = _csv_df_to_close(raw_data)
 
-    use_log = True
-    close, base = prepare_close_for_cusum(close, use_log=use_log)
-    thresholds = [0.0005, 0.001, 0.002, 0.005, 0.01]
-
-    fig, ax = plt.subplots(figsize=(11, 5.5))
-    ax.plot(close.index, close.values, color="#333", lw=1.2, label="close")
-    colors = plt.cm.tab10.colors
-    for i, th in enumerate(thresholds):
-        add_cusum_threshold_markers(
-            ax, close, base, th, color=colors[i % len(colors)]
-        )
-
-    subtitle = "CUSUM 序列: log(close)" if use_log else "CUSUM 序列: close"
-    ax.set_title(f"CUSUM 触发点（不同 threshold）\n{subtitle}")
-    ax.set_xlabel("时间")
-    ax.set_ylabel("价格")
-    ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left")
-    fig.tight_layout()
-    plt.show()
-
-    # enter = cusum_filter(np.log(close), 0.002)
-    # pt_sl = [0.02, 0.02]
-    # max_holding = [0, 12]
-    # out = get_barrier(close, enter, pt_sl, max_holding)
+    
