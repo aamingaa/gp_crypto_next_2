@@ -1,4 +1,6 @@
 from datetime import datetime
+from itertools import product
+import os
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -54,37 +56,46 @@ def prepare_close_for_cusum(close: pd.Series, use_log: bool = True):
     return close, base
 
 
-def add_cusum_threshold_markers(
-    ax,
-    close: pd.Series,
-    base: pd.Series,
-    threshold: float,
-    *,
-    color=None,
-    color_idx: int = 0,
-    cmap: str = "tab10",
-    label=None,
-):
+def cusum_filter_dynamic(series: pd.Series, threshold: pd.Series) -> pd.DatetimeIndex:
     """
-    在已有 axes 上为单个 threshold 绘制 CUSUM 触发点（与 prepare_close_for_cusum + cusum_filter 配合）。
+    动态阈值版本的 CUSUM 包装函数，不改动原始 cusum_filter 行为。
+
+    Parameters
+    ----------
+    series : pd.Series
+        一般传入价格的对数或收益序列，index 为时间。
+    threshold : pd.Series
+        与 series 时间索引对齐的动态阈值序列。
+
+    Returns
+    -------
+    pd.DatetimeIndex
+        触发事件的时间索引。
     """
-    events = cusum_filter(base, float(threshold))
-    y = close.reindex(events)
-    if color is None:
-        cmap_obj = plt.get_cmap(cmap)
-        color = cmap_obj(color_idx % cmap_obj.N)
-    lbl = label if label is not None else f"th={threshold} (n={len(events)})"
-    ax.scatter(
-        events,
-        y.values,
-        s=40,
-        marker="D",
-        color=color,
-        edgecolors="white",
-        linewidths=0.5,
-        zorder=3,
-        label=lbl,
-    )
+    series = pd.Series(series, copy=False).astype(float)
+    diff = series.diff().dropna()
+    threshold_series = pd.Series(threshold, copy=False).astype(float).reindex(diff.index)
+
+    t_events = []
+    s_pos, s_neg = 0.0, 0.0
+
+    for t in diff.index:
+        cur_threshold = threshold_series.loc[t]
+        if not np.isfinite(cur_threshold) or cur_threshold <= 0:
+            continue
+
+        d = diff.loc[t]
+        s_pos = max(0.0, s_pos + d)
+        s_neg = min(0.0, s_neg + d)
+
+        if s_pos > cur_threshold:
+            s_pos = 0.0
+            t_events.append(t)
+        elif s_neg < -cur_threshold:
+            s_neg = 0.0
+            t_events.append(t)
+
+    return pd.DatetimeIndex(t_events)
 
 
 def cusum_filter_side(series: pd.Series, threshold: float) -> pd.DatetimeIndex:
@@ -374,7 +385,8 @@ def _generate_date_range(start_date, end_date):
 if __name__ == "__main__":
 
     start_date = '2025-01'
-    end_date = '2025-01'
+    end_date = '2025-03'
+    
     df_list = []
     date_list = _generate_date_range(start_date, end_date)
     for date in date_list:
@@ -384,5 +396,177 @@ if __name__ == "__main__":
         print(f'df{len(df)}, read df_list {len(df_list)} done')
 
     raw_data = pd.concat(df_list, ignore_index=True)
+    raw_data['open_time'] = pd.to_datetime(raw_data['open_time'], unit='ms')
+    raw_data.set_index('open_time', inplace=True)
+    
+    close = raw_data['close'].astype(float)
+    log_close = np.log(close)
+    ret = log_close.diff()
+    sigma = ret.ewm(span=240).std()
+    threshold = (2.0 * sigma).bfill()
 
+    events = cusum_filter_dynamic(log_close, threshold=threshold)
+
+    # 价格曲线
+    plt.figure(figsize=(12, 5))
+    plt.plot(close.index, close.values, label="close", linewidth=1.2)
+    # 触发点（红色散点）
+    plt.scatter(events, close.loc[events], color="red", s=20, label="cusum events (adaptive thr)", zorder=3)
+    
+    plt.title("Close with CUSUM Event Marks")
+    plt.xlabel("time")
+    plt.ylabel("price")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("picture/cusum_event_marks.png", dpi=150, bbox_inches="tight")
+    # plt.show()
+
+    barrier_events = get_barrier(close, events, pt_sl=[1.2, 1.0], max_holding=[0, 10], target=sigma)
+    profit_events = barrier_events[barrier_events["ret"] > 0]
+    loss_events = barrier_events[barrier_events["ret"] < 0]
+    neutral_events = barrier_events[barrier_events["ret"] == 0]
+
+    profit_count = len(profit_events)
+    loss_count = len(loss_events)
+    total_count = len(barrier_events)
+    non_neutral_count = profit_count + loss_count
+
+    if non_neutral_count > 0:
+        profit_ratio_non_neutral = profit_count / non_neutral_count
+        loss_ratio_non_neutral = loss_count / non_neutral_count
+    else:
+        profit_ratio_non_neutral = 0.0
+        loss_ratio_non_neutral = 0.0
+
+    if total_count > 0:
+        profit_ratio_total = profit_count / total_count
+        loss_ratio_total = loss_count / total_count
+    else:
+        profit_ratio_total = 0.0
+        loss_ratio_total = 0.0
+
+    # print(
+    #     f"take profit count: {profit_count}, stop loss count: {loss_count}, "
+    #     f"tp/sl ratio: {profit_ratio_non_neutral:.2%}/{loss_ratio_non_neutral:.2%}"
+    # )
+    # print(
+    #     f"take profit(all): {profit_ratio_total:.2%}, "
+    #     f"stop loss(all): {loss_ratio_total:.2%}, total events: {total_count}"
+    # )
+
+    # 价格曲线
+    plt.figure(figsize=(12, 5))
+    plt.plot(close.index, close.values, label="close", linewidth=1.2)
+    # 区分止盈、止损和未触发水平障碍（由垂直障碍退出）
+    plt.scatter(
+        profit_events.index,
+        profit_events["price"],
+        color="green",
+        s=20,
+        label="take profit",
+        zorder=3,
+    )
+    plt.scatter(
+        loss_events.index,
+        loss_events["price"],
+        color="orange",
+        s=20,
+        label="stop loss",
+        zorder=3,
+    )
+    if not neutral_events.empty:
+        plt.scatter(
+            neutral_events.index,
+            neutral_events["price"],
+            color="gray",
+            s=18,
+            label="vertical exit",
+            zorder=2,
+        )
+    
+    plt.title("Close with Barrier Event Marks")
+    plt.xlabel("time")
+    plt.ylabel("price")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("picture/barrier_event_marks.png", dpi=150, bbox_inches="tight")
+    # plt.show()
+
+    # 参数网格遍历并保存统计结果
+    cusum_span_grid = [120, 240, 360]
+    cusum_k_grid = [1.5, 2.0, 2.5]
+    pt_sl_grid = [(1.0, 1.0), (1.2, 1.0), (1.5, 1.0)]
+    max_holding_grid = [(0, 6), (0, 10), (0, 24)]
+
+    grid_rows = []
+    for span, k, (pt, sl), (hold_days, hold_hours) in product(
+        cusum_span_grid, cusum_k_grid, pt_sl_grid, max_holding_grid
+    ):
+        sigma_i = ret.ewm(span=span).std()
+        threshold_i = (k * sigma_i).bfill()
+        events_i = cusum_filter_dynamic(log_close, threshold=threshold_i)
+
+        barrier_i = get_barrier(
+            close,
+            events_i,
+            pt_sl=[pt, sl],
+            max_holding=[hold_days, hold_hours],
+            target=sigma_i,
+        )
+
+        profit_i = barrier_i[barrier_i["ret"] > 0]
+        loss_i = barrier_i[barrier_i["ret"] < 0]
+        neutral_i = barrier_i[barrier_i["ret"] == 0]
+
+        profit_count_i = len(profit_i)
+        loss_count_i = len(loss_i)
+        neutral_count_i = len(neutral_i)
+        total_count_i = len(barrier_i)
+        non_neutral_count_i = profit_count_i + loss_count_i
+
+        if non_neutral_count_i > 0:
+            profit_ratio_non_neutral_i = profit_count_i / non_neutral_count_i
+            loss_ratio_non_neutral_i = loss_count_i / non_neutral_count_i
+        else:
+            profit_ratio_non_neutral_i = 0.0
+            loss_ratio_non_neutral_i = 0.0
+
+        if total_count_i > 0:
+            profit_ratio_total_i = profit_count_i / total_count_i
+            loss_ratio_total_i = loss_count_i / total_count_i
+            neutral_ratio_total_i = neutral_count_i / total_count_i
+        else:
+            profit_ratio_total_i = 0.0
+            loss_ratio_total_i = 0.0
+            neutral_ratio_total_i = 0.0
+
+        grid_rows.append(
+            {
+                "cusum_span": span,
+                "cusum_k": k,
+                "pt": pt,
+                "sl": sl,
+                "max_holding_days": hold_days,
+                "max_holding_hours": hold_hours,
+                "cusum_events_count": len(events_i),
+                "barrier_events_count": total_count_i,
+                "take_profit_count": profit_count_i,
+                "stop_loss_count": loss_count_i,
+                "vertical_exit_count": neutral_count_i,
+                "take_profit_ratio_non_neutral": profit_ratio_non_neutral_i,
+                "stop_loss_ratio_non_neutral": loss_ratio_non_neutral_i,
+                "take_profit_ratio_total": profit_ratio_total_i,
+                "stop_loss_ratio_total": loss_ratio_total_i,
+                "vertical_exit_ratio_total": neutral_ratio_total_i,
+            }
+        )
+
+    grid_df = pd.DataFrame(grid_rows)
+    grid_df = grid_df.sort_values(
+        by=["take_profit_ratio_non_neutral", "take_profit_count"], ascending=False
+    ).reset_index(drop=True)
+    os.makedirs("results", exist_ok=True)
+    output_csv = "results/barrier_grid_results.csv"
+    grid_df.to_csv(output_csv, index=False)
+    print(f"grid search results saved: {output_csv}, rows={len(grid_df)}")
     
