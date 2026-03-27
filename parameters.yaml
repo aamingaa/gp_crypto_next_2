@@ -11,6 +11,7 @@ data_dir: '/Users/aming/data/ETHUSDT/15m'
 include_categories: ['momentum']
 
 execution_mode: 'once'   # 'once' or 'loop' , 设定执行模式，once是一次性执行，loop是无限次执行
+eval_aux_metrics_enabled: true   # 是否启用 MI/熵辅助评估与排名输出
 
 gp_settings:
   population_size: 200

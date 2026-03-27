@@ -6,7 +6,7 @@
 - [ ] `plan_filter_cleanup.md`（筛选逻辑清理）
 - [ ] `plan_loss_refactor.md`（Loss/Fitness 改造）
 - [ ] `plan_label_triple_barrier.md`（Triple Barrier Label）
-- [ ] `plan_eval_system.md`（评估体系改造）
+- [x] `plan_eval_system.md`（评估体系改造）
 
 说明：
 1. 每开始执行一项，先把对应项标记为 `[-]`（进行中）。

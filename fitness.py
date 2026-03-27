@@ -191,6 +191,95 @@ def _log_loss(y, y_pred, w):
     return np.average(-score, weights=w)
 
 
+def _discretize_by_quantile(values, n_bins=16):
+    """Discretize a 1D array into quantile bins."""
+    arr = np.nan_to_num(values).flatten().astype(float)
+    if arr.size == 0:
+        return np.array([], dtype=int)
+
+    quantiles = np.linspace(0.0, 1.0, n_bins + 1)
+    edges = np.quantile(arr, quantiles)
+    edges = np.unique(edges)
+    if edges.size <= 2:
+        return np.zeros(arr.shape[0], dtype=int)
+
+    # digitize returns [1, n_bins], convert to [0, n_bins-1]
+    bins = np.digitize(arr, edges[1:-1], right=True)
+    return bins.astype(int)
+
+
+def _mutual_information_from_bins(x_bin, y_bin):
+    """Compute MI and entropies from two discrete arrays."""
+    if x_bin.size == 0 or y_bin.size == 0 or x_bin.size != y_bin.size:
+        return 0.0, 0.0, 0.0
+
+    x_bin = x_bin.astype(int)
+    y_bin = y_bin.astype(int)
+    n_x = int(np.max(x_bin)) + 1
+    n_y = int(np.max(y_bin)) + 1
+    if n_x <= 0 or n_y <= 0:
+        return 0.0, 0.0, 0.0
+
+    joint_counts = np.zeros((n_x, n_y), dtype=float)
+    np.add.at(joint_counts, (x_bin, y_bin), 1.0)
+    total = joint_counts.sum()
+    if total <= 0:
+        return 0.0, 0.0, 0.0
+
+    p_xy = joint_counts / total
+    p_x = p_xy.sum(axis=1)
+    p_y = p_xy.sum(axis=0)
+
+    eps = 1e-12
+    h_x = -np.sum(p_x * np.log(p_x + eps))
+    h_y = -np.sum(p_y * np.log(p_y + eps))
+
+    denominator = (p_x[:, None] * p_y[None, :]) + eps
+    mi = np.sum(p_xy * np.log((p_xy + eps) / denominator))
+    return float(mi), float(h_x), float(h_y)
+
+
+def _calculate_mi_score(y, y_pred, w, n_bins=16):
+    """
+    Normalized mutual information score in [0, 1].
+    Higher is better.
+    """
+    y_pred = np.nan_to_num(y_pred).flatten()
+    y = np.nan_to_num(y).flatten()
+    if len(y) != len(y_pred) or len(y) < 20:
+        return 0.0
+
+    x_bin = _discretize_by_quantile(y_pred, n_bins=n_bins)
+    y_bin = _discretize_by_quantile(y, n_bins=n_bins)
+    mi, h_x, h_y = _mutual_information_from_bins(x_bin, y_bin)
+    norm = np.sqrt(max(h_x, 0.0) * max(h_y, 0.0))
+    if norm <= 1e-12:
+        return 0.0
+
+    score = mi / norm
+    return float(np.clip(score, 0.0, 1.0))
+
+
+def _calculate_entropy_gain_score(y, y_pred, w, n_bins=16):
+    """
+    Conditional-entropy reduction ratio in [0, 1].
+    Equivalent to MI / H(Y): larger means stronger uncertainty reduction.
+    """
+    y_pred = np.nan_to_num(y_pred).flatten()
+    y = np.nan_to_num(y).flatten()
+    if len(y) != len(y_pred) or len(y) < 20:
+        return 0.0
+
+    x_bin = _discretize_by_quantile(y_pred, n_bins=n_bins)
+    y_bin = _discretize_by_quantile(y, n_bins=n_bins)
+    mi, _h_x, h_y = _mutual_information_from_bins(x_bin, y_bin)
+    if h_y <= 1e-12:
+        return 0.0
+
+    score = mi / h_y
+    return float(np.clip(score, 0.0, 1.0))
+
+
 def _calculate_average_pic(y, y_pred, w, n_chunk = 5):
     # 确保x和y长度相同
     y_pred = np.nan_to_num(y_pred).flatten()
@@ -477,6 +566,99 @@ def _cal_rets(y,y_pred,w):
     
     return pnl
 
+
+def _prepare_margin_inputs(y, y_pred, w, clip_low_q=0.01, clip_high_q=0.99):
+    """Prepare arrays for margin-based directional fitness."""
+    y_pred = np.nan_to_num(y_pred).flatten().astype(float)
+    y = np.nan_to_num(y).flatten().astype(float)
+    w = np.nan_to_num(w).flatten().astype(float)
+
+    if len(y_pred) != len(y):
+        raise ValueError("y and y_pred must have the same length")
+    if len(w) != len(y):
+        w = np.ones_like(y, dtype=float)
+
+    w = np.where(w > 0, w, 0.0)
+    if np.sum(w) <= 0:
+        w = np.ones_like(y, dtype=float)
+
+    # clip only inside loss/fitness to stabilize extreme outliers
+    low = np.nanquantile(y, clip_low_q)
+    high = np.nanquantile(y, clip_high_q)
+    y_for_loss = np.clip(y, low, high)
+
+    return y, y_for_loss, y_pred, w
+
+
+def _margin_and_extreme_weight(y_for_loss, y_pred, extreme_q=0.95):
+    """Compute margin and emphasize extreme absolute-return samples."""
+    margin = y_pred * y_for_loss
+    abs_y = np.abs(y_for_loss)
+    extreme_thr = np.nanquantile(abs_y, extreme_q)
+    is_extreme = abs_y >= extreme_thr
+
+    scale = np.nanquantile(abs_y, extreme_q) + 1e-12
+    extreme_weight = np.where(is_extreme, 1.0 + abs_y / scale, 1.0)
+
+    return margin, extreme_weight, is_extreme
+
+
+def _directional_reward(y, y_pred, w):
+    """Directional PnL-like reward, higher is better."""
+    pos = np.sign(np.nan_to_num(y_pred))
+    return np.average(y * pos, weights=w)
+
+
+def _extreme_wrong_sign_penalty(y, y_pred, w, lam=1.0, extreme_q=0.95):
+    """
+    Score = directional reward - lambda * weighted wrong-sign penalty.
+    """
+    y_raw, y_for_loss, y_pred, w = _prepare_margin_inputs(y, y_pred, w)
+    margin, extreme_weight, is_extreme = _margin_and_extreme_weight(
+        y_for_loss, y_pred, extreme_q=extreme_q
+    )
+
+    wrong_sign = (margin < 0).astype(float)
+    penalty_t = wrong_sign * extreme_weight * is_extreme.astype(float)
+    penalty = np.average(penalty_t, weights=w)
+    reward = _directional_reward(y_raw, y_pred, w)
+
+    return reward - lam * penalty
+
+
+def _weighted_margin_score(y, y_pred, w, lam=1.0, extreme_q=0.95):
+    """
+    Score = directional reward - lambda * weighted negative-margin loss.
+    """
+    y_raw, y_for_loss, y_pred, w = _prepare_margin_inputs(y, y_pred, w)
+    margin, extreme_weight, _ = _margin_and_extreme_weight(
+        y_for_loss, y_pred, extreme_q=extreme_q
+    )
+
+    penalty_t = extreme_weight * np.maximum(0.0, -margin)
+    penalty = np.average(penalty_t, weights=w)
+    reward = _directional_reward(y_raw, y_pred, w)
+
+    return reward - lam * penalty
+
+
+def _asym_extreme_direction_score(y, y_pred, w, a=3.0, b=0.3, m0=0.2, lam=1.0, extreme_q=0.95):
+    """
+    Asymmetric margin score with hard wrong-sign penalty and soft-margin penalty.
+    """
+    y_raw, y_for_loss, y_pred, w = _prepare_margin_inputs(y, y_pred, w)
+    margin, extreme_weight, _ = _margin_and_extreme_weight(
+        y_for_loss, y_pred, extreme_q=extreme_q
+    )
+
+    hard_wrong = np.maximum(0.0, -margin)
+    soft_margin = np.maximum(0.0, m0 - margin)
+    penalty_t = extreme_weight * (a * hard_wrong + b * soft_margin)
+    penalty = np.average(penalty_t, weights=w)
+    reward = _directional_reward(y_raw, y_pred, w)
+
+    return reward - lam * penalty
+
 def _calculate_max_drawdown(y,y_pred,w):
     
     pnl = _cal_pnl(y,y_pred,w)
@@ -653,6 +835,16 @@ sharpe_fixed_threshold = _Fitness(function=_sharpe_fixed_threshold,
                             greater_is_better=True)
 sharpe_std_threshold = _Fitness(function=_sharpe_std_threshold,
                             greater_is_better=True)
+extreme_wrong_sign_penalty = _Fitness(function=_extreme_wrong_sign_penalty,
+                            greater_is_better=True)
+weighted_margin_score = _Fitness(function=_weighted_margin_score,
+                            greater_is_better=True)
+asym_extreme_direction_score = _Fitness(function=_asym_extreme_direction_score,
+                            greater_is_better=True)
+mi_score = _Fitness(function=_calculate_mi_score,
+                            greater_is_better=True)
+entropy_gain_score = _Fitness(function=_calculate_entropy_gain_score,
+                            greater_is_better=True)
 
 
 
@@ -686,6 +878,11 @@ _fitness_map =     {'avg_pic':avg_pic,
                     'sharp':sharp,
                     'sharpe_fixed_threshold':sharpe_fixed_threshold,
                     'sharpe_std_threshold':sharpe_std_threshold,
+                    'extreme_wrong_sign_penalty':extreme_wrong_sign_penalty,
+                    'weighted_margin_score':weighted_margin_score,
+                    'asym_extreme_direction_score':asym_extreme_direction_score,
+                    'mi_score':mi_score,
+                    'entropy_gain_score':entropy_gain_score,
                     'max_dd':max_dd,
                     'avg_mdd':avg_mdd,
                     'max_ic':max_ic,
@@ -698,3 +895,75 @@ _backtest_map = {'pnl':pnl,
                  'rts':rts,
                  'rolling_sharp':rolling_sharp
                 }
+
+
+def _plot_margin_metric_demo(y, y_pred_good, y_pred_bad, save_path="fitness_margin_demo.png"):
+    """Plot synthetic fat-tail returns and save figure to file."""
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib is not installed, skip plotting.")
+        return
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+    axes[0, 0].plot(y, color="tab:blue", alpha=0.75, linewidth=1.0)
+    axes[0, 0].set_title("Synthetic Fat-Tail Return (t-dist)")
+    axes[0, 0].set_xlabel("Index")
+    axes[0, 0].set_ylabel("Return")
+
+    axes[0, 1].scatter(y, y_pred_good, s=10, alpha=0.45, label="good_pred")
+    axes[0, 1].scatter(y, y_pred_bad, s=10, alpha=0.35, label="bad_pred")
+    axes[0, 1].set_title("y vs prediction")
+    axes[0, 1].set_xlabel("y")
+    axes[0, 1].set_ylabel("y_pred")
+    axes[0, 1].legend(loc="best")
+
+    axes[1, 0].hist(y, bins=60, alpha=0.8, color="tab:purple")
+    axes[1, 0].set_title("Return Distribution (fat-tail)")
+    axes[1, 0].set_xlabel("y")
+    axes[1, 0].set_ylabel("Count")
+
+    axes[1, 1].hist(y_pred_good, bins=60, alpha=0.55, label="good_pred")
+    axes[1, 1].hist(y_pred_bad, bins=60, alpha=0.55, label="bad_pred")
+    axes[1, 1].set_title("Prediction Distribution")
+    axes[1, 1].set_xlabel("y_pred")
+    axes[1, 1].set_ylabel("Count")
+    axes[1, 1].legend(loc="best")
+
+    plt.tight_layout()
+    fig.savefig(save_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    print(f"plot saved to: {save_path}")
+
+
+def main():
+    """Quick sanity check for new margin-based fitness metrics."""
+    np.random.seed(42)
+    n = 800
+    y = np.random.standard_t(df=3, size=n) * 0.02
+    w = np.ones(n)
+
+    y_pred_good = y + np.random.normal(0.0, 0.01, size=n)
+    y_pred_bad = -y + np.random.normal(0.0, 0.01, size=n)
+
+    metrics = [
+        ("extreme_wrong_sign_penalty", _extreme_wrong_sign_penalty),
+        ("weighted_margin_score", _weighted_margin_score),
+        ("asym_extreme_direction_score", _asym_extreme_direction_score),
+    ]
+
+    print("=== Margin-based fitness demo (fat-tail t-distribution) ===")
+    for metric_name, metric_func in metrics:
+        good_score = metric_func(y, y_pred_good, w)
+        bad_score = metric_func(y, y_pred_bad, w)
+        print(
+            f"{metric_name}: "
+            f"good={good_score:.6f}, bad={bad_score:.6f}, good>bad={good_score > bad_score}"
+        )
+
+    _plot_margin_metric_demo(y, y_pred_good, y_pred_bad, save_path="fitness_margin_demo.png")
+
+
+if __name__ == "__main__":
+    main()

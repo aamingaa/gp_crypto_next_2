@@ -22,7 +22,7 @@ from sklearn.linear_model import LinearRegression
 import cloudpickle
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-from scipy.stats import zscore, kurtosis, skew, yeojohnson, boxcox
+from scipy.stats import zscore, kurtosis, skew, yeojohnson, boxcox, spearmanr
 from scipy.stats import tukeylambda, mstats
 from expressionProgram import FeatureEvaluator
 from concurrent.futures import ProcessPoolExecutor
@@ -31,7 +31,7 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 pd.set_option('display.max_columns', 100)
 pd.set_option('display.max_rows', 100)
 
-norm_y_list = ['avg_pic','avg_sic','max_ic','max_ic_train','given_ic_test']
+norm_y_list = ['avg_pic','avg_sic','max_ic','max_ic_train','given_ic_test', 'mi_score', 'entropy_gain_score']
 raw_y_list = ['calmar','sharp','sharpe_fixed_threshold','sharpe_std_threshold','max_dd','avg_mdd']
 
 def calculate_annual_bars(freq: str) -> int:
@@ -89,6 +89,7 @@ class GPAnalyzer:
         self.end_date_test = self.config.get('end_date_test', '')
         self.gp_settings = self.config.get('gp_settings', {})
         self.metric = self.gp_settings.get('metric', 'pearson')
+        self.eval_aux_metrics_enabled = self.config.get('eval_aux_metrics_enabled', True)
         self.verbose_logging = self.config.get('verbose_logging', False)
         self.rolling_window = self.config.get('rolling_window', 2000)
         self.annual_bars = calculate_annual_bars(self.freq)
@@ -338,6 +339,86 @@ class GPAnalyzer:
         """
         return df.loc[:, ~df.columns.duplicated()]
 
+    def _add_aux_metric_percentile_ranks(self, df):
+        """Add percentile-rank columns for MI/entropy auxiliary metrics."""
+        if not self.eval_aux_metrics_enabled:
+            return df
+
+        aux_metrics = ['mi_score', 'entropy_gain_score']
+        for metric in aux_metrics:
+            for split in ['train', 'test']:
+                metric_col = f'fitness_{metric}_{split}'
+                rank_col = f'{metric_col}_pct_rank'
+                if metric_col in df.columns:
+                    values = pd.to_numeric(df[metric_col], errors='coerce')
+                    df[rank_col] = values.rank(pct=True, method='average')
+        return df
+
+    def _build_aux_metric_diagnostics(self, df):
+        """Build Spearman and stability diagnostics for MI/entropy."""
+        diagnostics = {'spearman': {}, 'stability': {}}
+        if not self.eval_aux_metrics_enabled:
+            return diagnostics
+
+        aux_metrics = ['mi_score', 'entropy_gain_score']
+        baseline_metrics = ['avg_sic', 'avg_pic']
+        splits = ['train', 'test']
+
+        for aux_metric in aux_metrics:
+            for baseline_metric in baseline_metrics:
+                for split in splits:
+                    aux_col = f'fitness_{aux_metric}_{split}'
+                    baseline_col = f'fitness_{baseline_metric}_{split}'
+                    diag_key = f'{aux_metric}_vs_{baseline_metric}_{split}'
+
+                    if aux_col not in df.columns or baseline_col not in df.columns:
+                        diagnostics['spearman'][diag_key] = np.nan
+                        continue
+
+                    pair_df = df[[aux_col, baseline_col]].apply(pd.to_numeric, errors='coerce').dropna()
+                    if len(pair_df) < 5:
+                        diagnostics['spearman'][diag_key] = np.nan
+                        continue
+
+                    corr, _ = spearmanr(pair_df[aux_col].values, pair_df[baseline_col].values)
+                    diagnostics['spearman'][diag_key] = float(corr) if np.isfinite(corr) else np.nan
+
+        for aux_metric in aux_metrics:
+            train_col = f'fitness_{aux_metric}_train'
+            test_col = f'fitness_{aux_metric}_test'
+            diag_key = f'{aux_metric}_train_test_top10_overlap'
+
+            if train_col not in df.columns or test_col not in df.columns:
+                diagnostics['stability'][diag_key] = np.nan
+                continue
+
+            pair_df = df[[train_col, test_col]].apply(pd.to_numeric, errors='coerce').dropna()
+            n_samples = len(pair_df)
+            if n_samples < 10:
+                diagnostics['stability'][diag_key] = np.nan
+                continue
+
+            top_n = max(1, int(np.ceil(n_samples * 0.1)))
+            train_top_idx = set(pair_df[train_col].nlargest(top_n).index)
+            test_top_idx = set(pair_df[test_col].nlargest(top_n).index)
+            overlap_ratio = len(train_top_idx & test_top_idx) / float(top_n)
+            diagnostics['stability'][diag_key] = float(overlap_ratio)
+
+        return diagnostics
+
+    def _enrich_aux_metric_outputs(self, df, diagnostics_output_dir=None):
+        """Attach percentile-rank fields and optionally persist diagnostics."""
+        df = self._add_aux_metric_percentile_ranks(df)
+        diagnostics = self._build_aux_metric_diagnostics(df)
+
+        if diagnostics_output_dir is not None and self.eval_aux_metrics_enabled:
+            diagnostics_path = Path(diagnostics_output_dir) / 'aux_metric_diagnostics.yaml'
+            with open(diagnostics_path, 'w', encoding='utf-8') as file:
+                yaml.safe_dump(diagnostics, file, sort_keys=True, allow_unicode=True)
+            logger.info(f'已写入辅助评估诊断文件: {diagnostics_path}')
+
+        return df
+
     def evaluate_single_factor_for_new_genes(self, factor_expression):
         """
         评估单个新生成因子的表现。
@@ -383,6 +464,10 @@ class GPAnalyzer:
         for factor_expression in self.pred_data_df_train.columns:
             self.evaluate_single_factor_for_new_genes(factor_expression)
 
+        self.best_programs_df_dedup = self._enrich_aux_metric_outputs(
+            self.best_programs_df_dedup,
+            diagnostics_output_dir=self.model_folder
+        )
         self.best_programs_df_dedup.to_csv(self.model_folder / 'best_programs_df.csv.gz', index=False,
                                            compression='gzip')
 
@@ -485,6 +570,7 @@ class GPAnalyzer:
                 total_factor_df.loc[index, 'max_ic_train_check'] = max_ic_train_check
                 total_factor_df.loc[index, 'given_ic_test'] = given_ic_test
 
+            total_factor_df = self._enrich_aux_metric_outputs(total_factor_df)
             self.save_total_factor_df(total_factor_df)
 
   
@@ -518,6 +604,7 @@ class GPAnalyzer:
             z.loc[index, 'max_ic_train_check'] = max_ic_train_check
             z.loc[index, 'given_ic_test'] = given_ic_test
                 
+        z = self._enrich_aux_metric_outputs(z)
         # 保存到gp_models文件夹下
         self.save_total_factor_df(z)
         
@@ -530,6 +617,7 @@ class GPAnalyzer:
         z = pd.read_csv(csv_path)
 
         # 统一改为分位数筛选：每个指标都取该批因子前10%（P90）阈值，再取交集
+        # 注意：mi_score / entropy_gain_score 仅用于诊断，不进入这里的硬筛选条件。
         metric_cols = [
             'fitness_sharp_train',
             'fitness_sharp_test',

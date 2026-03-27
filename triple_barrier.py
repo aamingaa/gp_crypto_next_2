@@ -445,15 +445,6 @@ if __name__ == "__main__":
         profit_ratio_total = 0.0
         loss_ratio_total = 0.0
 
-    # print(
-    #     f"take profit count: {profit_count}, stop loss count: {loss_count}, "
-    #     f"tp/sl ratio: {profit_ratio_non_neutral:.2%}/{loss_ratio_non_neutral:.2%}"
-    # )
-    # print(
-    #     f"take profit(all): {profit_ratio_total:.2%}, "
-    #     f"stop loss(all): {loss_ratio_total:.2%}, total events: {total_count}"
-    # )
-
     # 价格曲线
     plt.figure(figsize=(12, 5))
     plt.plot(close.index, close.values, label="close", linewidth=1.2)
