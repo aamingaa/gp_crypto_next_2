@@ -10,9 +10,10 @@ AFML Chapter 4 抽样与加权工具（项目可运行版）。
 
 from __future__ import annotations
 
+import argparse
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -382,6 +383,191 @@ def weights_by_time_decay(
 
 
 # =======================================================
+# Triple Barrier 对接工具
+def events_from_triple_barrier(
+    barrier_events: pd.DataFrame,
+    exit_col: str = "exit",
+    keep_cols: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
+    """
+    将 triple_barrier 输出转换为 sample_unique 需要的事件格式。
+
+    约定：
+    - 输入 index 为事件起点 t0
+    - 输入包含退出时间列（默认 `exit`）
+    - 输出至少包含 `t1` 列（事件终点）
+    """
+    if not isinstance(barrier_events, pd.DataFrame):
+        raise ValueError("barrier_events 必须是 DataFrame")
+    if exit_col not in barrier_events.columns:
+        raise ValueError(f"barrier_events 缺少列: {exit_col}")
+    if barrier_events.empty:
+        raise ValueError("barrier_events 不能为空")
+    if barrier_events.index.hasnans:
+        raise ValueError("barrier_events.index 不能包含 NaN/NaT")
+
+    out = pd.DataFrame(index=barrier_events.index.copy())
+    out["t1"] = pd.to_datetime(barrier_events[exit_col], errors="coerce")
+    out = out.dropna(subset=["t1"])
+    if out.empty:
+        raise ValueError("barrier_events 中没有有效的退出时间")
+
+    # 保证事件区间合法：t1 不早于 t0
+    out = out[out["t1"] >= out.index]
+    if out.empty:
+        raise ValueError("不存在满足 t1 >= t0 的有效事件")
+
+    if keep_cols is not None:
+        for col in keep_cols:
+            if col in barrier_events.columns:
+                out[col] = barrier_events.loc[out.index, col]
+
+    # 同一 t0 若重复，保留最早 t1，减少重叠歧义
+    out = out.sort_index()
+    out = out.groupby(level=0, sort=True).agg({"t1": "min", **{c: "first" for c in out.columns if c != "t1"}})
+    return out
+
+
+def build_composite_event_weights(
+    data: pd.Series | pd.DataFrame,
+    events: pd.DataFrame,
+    num_threads: int = 1,
+    td: float = 1.0,
+    normalize: bool = True,
+) -> pd.DataFrame:
+    """
+    基于并发唯一性、收益贡献、时间衰减构建组合权重。
+    返回列：
+    - tW: 并发唯一性权重
+    - w_ret: 收益贡献权重
+    - w_td: 时间衰减权重
+    - w: 组合权重（可选归一化）
+    """
+    events_ = _validate_events(events)
+    t_weight = weights_by_concurrent_events(data=data, events=events_, num_threads=num_threads)["tW"]
+    r_weight = weights_by_return(data=data, events=events_, num_threads=num_threads)["w"]
+    d_weight = weights_by_time_decay(data=data, events=events_, num_threads=num_threads, td=td)
+
+    out = pd.DataFrame(index=events_.index)
+    out["tW"] = t_weight.reindex(out.index).fillna(0.0)
+    out["w_ret"] = r_weight.reindex(out.index).fillna(0.0)
+    out["w_td"] = d_weight.reindex(out.index).fillna(0.0)
+    out["w"] = out["tW"] * out["w_ret"] * out["w_td"]
+
+    if normalize:
+        denom = out["w"].sum()
+        if denom > 0:
+            out["w"] *= out.shape[0] / denom
+    return out
+
+
+def triple_barrier_sampling_pipeline(
+    close: pd.Series | pd.DataFrame,
+    enter: Sequence,
+    pt_sl: Sequence[float],
+    max_holding: Sequence[int],
+    target: Optional[pd.Series] = None,
+    side: Optional[pd.Series] = None,
+    num_threads: int = 1,
+    td: float = 1.0,
+    sample_len: Optional[int] = None,
+    random_seed: int = 42,
+    use_fast: bool = True,
+) -> Dict[str, Any]:
+    """
+    一键串联 Triple Barrier + Sample Unique。
+
+    返回：
+    - barrier_events: triple barrier 原始输出（含 exit/ret/side）
+    - events: sample_unique 事件格式（含 t1）
+    - weights: 组合权重表
+    - idx_m: 指示矩阵
+    - phi: sequential bootstrap 选中的列号（可重复）
+    - sampled_events: 按 phi 抽样后的事件（可重复）
+    - sampled_weights: sampled_events 对应权重
+    """
+    data_series = _as_series(close, "close")
+    data_series = data_series.sort_index()
+    data_series = data_series[~data_series.index.duplicated(keep="last")]
+
+    # 仅在函数内导入，避免模块级循环依赖。
+    import triple_barrier as tb
+
+    if use_fast:
+        barrier_events = tb.get_barrier_fast(
+            close=data_series,
+            enter=enter,
+            pt_sl=pt_sl,
+            max_holding=max_holding,
+            target=target,
+            side=side,
+        )
+    else:
+        barrier_events = tb.get_barrier(
+            close=data_series,
+            enter=enter,
+            pt_sl=pt_sl,
+            max_holding=max_holding,
+            target=target,
+            side=side,
+        )
+
+    events = events_from_triple_barrier(
+        barrier_events=barrier_events,
+        exit_col="exit",
+        keep_cols=["ret", "side"],
+    )
+    weights = build_composite_event_weights(
+        data=data_series,
+        events=events[["t1"]],
+        num_threads=num_threads,
+        td=td,
+        normalize=True,
+    )
+    idx_m = build_indicator_matrix_parallel(data=data_series, events=events[["t1"]], num_threads=max(1, num_threads))
+
+    if idx_m.empty:
+        return {
+            "barrier_events": barrier_events,
+            "events": events,
+            "weights": weights,
+            "idx_m": idx_m,
+            "phi": [],
+            "sampled_events": events.iloc[0:0].copy(),
+            "sampled_weights": weights.iloc[0:0].copy(),
+        }
+
+    if sample_len is None:
+        sample_len_ = idx_m.shape[1]
+    else:
+        sample_len_ = int(sample_len)
+        sample_len_ = min(max(sample_len_, 1), idx_m.shape[1])
+
+    rs = np.random.RandomState(random_seed)
+    phi = sequential_bootstrap_parallel(
+        idx_m=idx_m,
+        sample_len=sample_len_,
+        num_threads=max(1, num_threads),
+        random_state=rs,
+    )
+
+    sampled_events = events.iloc[np.asarray(phi, dtype=int)].copy()
+    sampled_events["bootstrap_col"] = phi
+    sampled_weights = weights.reindex(sampled_events.index).copy()
+    sampled_weights["bootstrap_col"] = phi
+
+    return {
+        "barrier_events": barrier_events,
+        "events": events,
+        "weights": weights,
+        "idx_m": idx_m,
+        "phi": phi,
+        "sampled_events": sampled_events,
+        "sampled_weights": sampled_weights,
+    }
+
+
+# =======================================================
 # 快速随机测试工具（可选）
 def random_event_end_times(num_obs: int, num_bars: int, max_h: int, random_seed: int = 42) -> pd.Series:
     """生成整数 bar 版 t0->t1 映射，用于快测。"""
@@ -439,6 +625,130 @@ def run_monte_carlo_bootstrap_experiments(
     return pd.DataFrame(out)
 
 
+def validate_sampling_quality(
+    idx_m: pd.DataFrame,
+    weights: Optional[pd.DataFrame] = None,
+    num_trials: int = 200,
+    random_seed: int = 42,
+) -> Dict[str, float]:
+    """
+    对 sample_unique 抽样质量做最小闭环验证。
+
+    输出指标：
+    - std_u_mean: 随机抽样平均唯一性均值
+    - seq_u_mean: 顺序抽样平均唯一性均值
+    - seq_win_ratio: seqU > stdU 的实验占比
+    - uniqueness_lift: seq_u_mean - std_u_mean
+    - weight_top_1pct_mass / weight_top_5pct_mass: 组合权重头部集中度（可选）
+    """
+    if not isinstance(idx_m, pd.DataFrame) or idx_m.empty:
+        raise ValueError("idx_m 必须是非空 DataFrame")
+    if num_trials <= 0:
+        raise ValueError("num_trials 必须是正整数")
+
+    rs = np.random.RandomState(random_seed)
+    std_values: List[float] = []
+    seq_values: List[float] = []
+
+    for i in range(int(num_trials)):
+        rs_i = np.random.RandomState(rs.randint(0, 2**31 - 1) + i)
+        random_cols = rs_i.choice(idx_m.columns, size=idx_m.shape[1], replace=True)
+        std_u = float(average_uniqueness(idx_m[random_cols]).mean())
+
+        seq_cols = sequential_bootstrap_parallel(
+            idx_m=idx_m,
+            sample_len=idx_m.shape[1],
+            num_threads=1,
+            random_state=rs_i,
+        )
+        seq_u = float(average_uniqueness(idx_m[seq_cols]).mean())
+
+        std_values.append(std_u)
+        seq_values.append(seq_u)
+
+    std_arr = np.asarray(std_values, dtype=float)
+    seq_arr = np.asarray(seq_values, dtype=float)
+    metrics: Dict[str, float] = {
+        "std_u_mean": float(np.nanmean(std_arr)),
+        "seq_u_mean": float(np.nanmean(seq_arr)),
+        "seq_win_ratio": float(np.mean(seq_arr > std_arr)),
+    }
+    metrics["uniqueness_lift"] = metrics["seq_u_mean"] - metrics["std_u_mean"]
+
+    if isinstance(weights, pd.DataFrame) and "w" in weights.columns and not weights.empty:
+        w = pd.to_numeric(weights["w"], errors="coerce").fillna(0.0)
+        w = w[w > 0]
+        if not w.empty:
+            w_sorted = w.sort_values(ascending=False)
+            n = len(w_sorted)
+            top1 = max(1, int(np.ceil(n * 0.01)))
+            top5 = max(1, int(np.ceil(n * 0.05)))
+            total = float(w_sorted.sum())
+            metrics["weight_top_1pct_mass"] = float(w_sorted.iloc[:top1].sum() / total) if total > 0 else np.nan
+            metrics["weight_top_5pct_mass"] = float(w_sorted.iloc[:top5].sum() / total) if total > 0 else np.nan
+        else:
+            metrics["weight_top_1pct_mass"] = np.nan
+            metrics["weight_top_5pct_mass"] = np.nan
+    return metrics
+
+
+def main() -> None:
+    """
+    最小可运行示例：
+    1) 合成价格序列
+    2) Triple Barrier 生成事件
+    3) Sample Unique 抽样/加权
+    4) 输出抽样质量指标
+    """
+    parser = argparse.ArgumentParser(description="Run triple-barrier + sample-unique quick validation.")
+    parser.add_argument("--n-bars", type=int, default=360, help="Number of synthetic bars.")
+    parser.add_argument("--sample-len", type=int, default=40, help="Bootstrap sample length.")
+    parser.add_argument("--num-trials", type=int, default=30, help="Trials for sampling quality validation.")
+    parser.add_argument("--random-seed", type=int, default=42, help="Random seed.")
+    args = parser.parse_args()
+
+    rs = np.random.RandomState(args.random_seed)
+    n = int(args.n_bars)
+    if n < 120:
+        raise ValueError("n-bars 至少为 120，避免事件过少导致评估不稳定")
+    index = pd.date_range("2025-01-01", periods=n, freq="15min")
+
+    # 构造可复现的 fat-tail 收益，再还原为价格序列
+    log_ret = rs.standard_t(df=5, size=n) * 0.002
+    close = pd.Series(100.0 * np.exp(np.cumsum(log_ret)), index=index, name="close")
+
+    # 用简单分位规则构造 enter，避免依赖额外复杂预处理
+    trigger = pd.Series(log_ret, index=index).abs()
+    enter = trigger[trigger > trigger.quantile(0.90)].index
+
+    out = triple_barrier_sampling_pipeline(
+        close=close,
+        enter=enter,
+        pt_sl=[1.2, 1.0],
+        max_holding=[0, 16],  # 约 4 小时
+        target=trigger.ewm(span=96).std().bfill(),
+        side=None,
+        num_threads=1,
+        td=0.8,
+        sample_len=args.sample_len,
+        random_seed=args.random_seed,
+        use_fast=True,
+    )
+
+    quality = validate_sampling_quality(
+        idx_m=out["idx_m"],
+        weights=out["weights"],
+        num_trials=args.num_trials,
+        random_seed=args.random_seed,
+    )
+
+    print("=== sample_unique pipeline summary ===")
+    print(f"events_raw={len(out['barrier_events'])}, events_valid={len(out['events'])}, sampled={len(out['sampled_events'])}")
+    print("=== sampling quality ===")
+    for key, value in quality.items():
+        print(f"{key}: {value:.6f}")
+
+
 # =======================================================
 # 向后兼容别名（旧名 -> 新名）
 num_co_events = count_concurrent_events
@@ -454,3 +764,7 @@ wght_by_td = weights_by_time_decay
 rnd_t1 = random_event_end_times
 auxMC = run_bootstrap_comparison_example
 MT_MC = run_monte_carlo_bootstrap_experiments
+
+
+if __name__ == "__main__":
+    main()
